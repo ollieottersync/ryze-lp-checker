@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ryze LP Performance Checker</title>
+<meta name="description" content="Paste any Base wallet address and get a realized-APR report for its Ryze Protocol liquidity positions. Computed entirely in your browser from public data.">
+<style>
+  :root{
+    --bg:#f6f8fb; --card:#ffffff; --ink:#16202e; --muted:#5b6b80;
+    --accent:#0e7c66; --accent-dark:#0a5f4f; --line:#e3e9f0;
+    --good:#0e7c66; --warn:#b7791f; --bad:#b3362b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    line-height:1.5;-webkit-text-size-adjust:100%}
+  .wrap{max-width:760px;margin:0 auto;padding:24px 16px 64px}
+  header{margin:8px 0 20px}
+  h1{font-size:1.65rem;margin:0 0 6px;letter-spacing:-0.01em}
+  .sub{color:var(--muted);margin:0;font-size:0.98rem}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;
+    padding:20px;margin:0 0 16px;box-shadow:0 1px 3px rgba(16,32,46,.06)}
+  label{display:block;font-weight:600;font-size:0.9rem;margin-bottom:8px}
+  .row{display:flex;gap:10px;flex-wrap:wrap}
+  input[type=text]{flex:1 1 280px;padding:12px 14px;font-size:0.95rem;border:1px solid var(--line);
+    border-radius:10px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--ink);
+    background:#fbfcfe;min-width:0}
+  input[type=text]:focus{outline:2px solid var(--accent);border-color:var(--accent)}
+  button{padding:12px 22px;font-size:0.95rem;font-weight:700;color:#fff;background:var(--accent);
+    border:0;border-radius:10px;cursor:pointer;white-space:nowrap}
+  button:hover{background:var(--accent-dark)}
+  button:disabled{opacity:.55;cursor:wait}
+  .hint{font-size:0.82rem;color:var(--muted);margin:10px 0 0}
+  .progress{margin-top:14px;display:none}
+  .progress.on{display:block}
+  .bar{height:8px;background:#e8eef4;border-radius:99px;overflow:hidden}
+  .bar>div{height:100%;width:0;background:var(--accent);border-radius:99px;transition:width .3s}
+  .pmsg{font-size:0.85rem;color:var(--muted);margin-top:8px;min-height:1.4em}
+  .err{display:none;background:#fdecea;border:1px solid #f3c1bb;color:var(--bad);
+    border-radius:10px;padding:12px 14px;margin-top:14px;font-size:0.92rem}
+  .err.on{display:block}
+  #results{display:none}
+  #results.on{display:block}
+  .walletline{font-size:0.85rem;color:var(--muted);margin:0 0 12px;word-break:break-all}
+  .walletline code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:0.82rem}
+  .blend{background:linear-gradient(135deg,#0e7c66,#14957c);color:#fff;border-radius:14px;
+    padding:20px;margin-bottom:16px}
+  .blend .k{font-size:0.78rem;text-transform:uppercase;letter-spacing:.08em;opacity:.85;margin-bottom:4px}
+  .blend .big{font-size:2.1rem;font-weight:800;letter-spacing:-0.02em;line-height:1.1}
+  .blend .row2{display:flex;gap:24px;flex-wrap:wrap;margin-top:12px}
+  .blend .stat .k{margin:0}
+  .blend .stat .v{font-size:1.05rem;font-weight:700}
+  .pools{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
+  @media (max-width:560px){.pools{grid-template-columns:1fr}}
+  .pool{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
+  .pool h3{margin:0 0 10px;font-size:1rem}
+  .pool .apr{font-size:1.5rem;font-weight:800;color:var(--accent);margin:2px 0 10px}
+  .pool table{width:100%;border-collapse:collapse;font-size:0.86rem}
+  .pool td{padding:3px 0;color:var(--muted)}
+  .pool td:last-child{text-align:right;color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums}
+  .meta{display:flex;gap:8px 20px;flex-wrap:wrap;font-size:0.82rem;color:var(--muted);margin:4px 0 0}
+  .meta b{color:var(--ink);font-weight:600}
+  .notice{background:#fff8e8;border:1px solid #ecd9a8;color:#7a5b16;border-radius:10px;
+    padding:12px 14px;font-size:0.9rem;margin-bottom:16px}
+  footer{margin-top:28px;font-size:0.8rem;color:var(--muted)}
+  footer h4{font-size:0.85rem;margin:18px 0 6px;color:var(--ink)}
+  footer ul{margin:6px 0;padding-left:20px}
+  footer li{margin-bottom:4px}
+  .deet{margin-top:10px;border:1px solid var(--line);border-radius:10px;background:#fbfcfe}
+  .deet summary{cursor:pointer;padding:10px 14px;font-weight:600;font-size:0.85rem;color:var(--ink)}
+  .deet ol{margin:6px 0;padding:0 20px 0 36px;font-size:0.82rem}
+  .deet li{margin-bottom:6px}
+  .deet .fine{font-size:0.78rem;padding:0 14px 12px;color:var(--muted)}
+  .footgrid{display:flex;gap:24px;flex-wrap:wrap}
+  .footgrid>div{flex:1 1 220px}
+  .na{color:var(--muted);font-weight:400}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Ryze LP Performance Checker</h1>
+    <p class="sub">Paste any Base wallet address for an instant realized-APR report on its
+      Ryze Protocol liquidity positions. Computed entirely in your browser from public data &mdash; nothing is uploaded or tracked.</p>
+  </header>
+
+  <div class="card">
+    <form id="form" autocomplete="off">
+      <label for="addr">Base wallet address</label>
+      <div class="row">
+        <input type="text" id="addr" name="addr" spellcheck="false"
+               placeholder="0x…">
+        <button type="submit" id="go">Check performance</button>
+      </div>
+      <p class="hint">Read-only: this page only queries public blockchain and price APIs. It never asks for a wallet connection or signature.</p>
+    </form>
+    <div class="progress" id="progress">
+      <div class="bar"><div id="barfill"></div></div>
+      <div class="pmsg" id="pmsg"></div>
+    </div>
+    <div class="err" id="err"></div>
+  </div>
+
+  <div id="results"></div>
+
+  <div class="card" id="subcard">
+    <h2 style="margin:0 0 6px;font-size:1.15rem">Get the weekly digest</h2>
+    <p class="sub" style="margin-bottom:14px">One email every Monday with this wallet's realized APR, total cost basis, capital at work, current value, and rewards. Double opt-in &mdash; confirm via the email we send you. Unsubscribe anytime.</p>
+    <form id="subform" autocomplete="off">
+      <label for="subemail">Email</label>
+      <input type="text" id="subemail" name="subemail" spellcheck="false" placeholder="you@example.com" style="margin-bottom:12px">
+      <label for="subwallet">Base wallet address</label>
+      <input type="text" id="subwallet" name="subwallet" spellcheck="false" placeholder="0x&hellip;" style="margin-bottom:12px">
+      <div id="tswidget" style="margin-bottom:12px"></div>
+      <div class="row">
+        <button type="submit" id="subgo">Subscribe</button>
+      </div>
+      <p class="hint" id="submsg"></p>
+    </form>
+  </div>
+
+  <footer>
+    <div class="footgrid">
+      <div>
+        <h4>Methodology</h4>
+        <ul>
+          <li>Total cost basis = the actual amount the wallet committed, valued on deposit day &mdash; what went in <i>before</i> the protocol converted it into the pool position. The purest comparable figure: Ryze pools aren't 50/50, so the converted split differs with every deposit. Capital at work time-weights that over the window (a deposit made later counts for fewer days), which is why it can read lower than total cost basis. The APR is always figured on capital at work.</li>
+          <li>Capital at work = FIFO cost basis of what's in the pool, averaged over the window: each deposit is valued at that day's close (Kraken daily closes, USDC = $1); withdrawals consume the oldest lots first at their original cost. Market moves after a deposit never change it.</li>
+          <li>Current value = what's still in the pool at today's closes. The gap between current value and capital at work is market gain or loss.</li>
+          <li>Deposits: transactions where the wallet sends USDC/WETH/cbBTC and the same transaction deposits LP into a Ryze pool. Plain swaps excluded; dust returned to the wallet is netted off.</li>
+          <li>Withdrawals: transactions that burn pool LP with underlying returned to the wallet.</li>
+          <li>Rewards = claimed (pool &rarr; wallet USDC transfers) + unclaimed (read live from each pool's claimable-rewards view).</li>
+          <li>Realized APR = rewards &divide; capital at work &times; 365/days (capital at work is the time-weighted average over the window; total cost basis is shown alongside so you can see what actually went in). APY = (1+APR/52)<sup>52</sup>&minus;1 (weekly compounding).</li>
+        </ul>
+        <details class="deet">
+          <summary>How capital at work is computed, step by step</summary>
+          <ol>
+            <li><b>Find the flows.</b> Every deposit and withdrawal becomes a dated entry: date, pool, and token amounts (USDC / WETH / cbBTC). Claims never touch capital at work.</li>
+            <li><b>Pool migrations net out.</b> When a withdrawal is followed within 2 days by deposits into the same pool (e.g. a pool migration: withdraw from the old pool, deposit into the new one), the pair is netted to its capital delta &mdash; only genuinely new money counts as a deposit.</li>
+            <li><b>Build FIFO lots, day by day.</b> Starting from the first activity day through today, each day's deposits push a cost-basis lot valued at that day's close (USDC at $1, WETH at the ETH close, cbBTC at the BTC close &mdash; Kraken daily closes, Coinbase Exchange fallback). Each day's withdrawals consume the oldest lots first at their original cost. Cost basis can never go negative.</li>
+            <li><b>Time-weight it.</b> Capital at work is the average of the daily cost-basis balances, per pool. The blended figure is the sum of both pools. Because each lot carries its deposit-day price, market moves after a flow never change it &mdash; so the APR is pure yield, not price appreciation.</li>
+            <li><b>Divide rewards by capital at work.</b> Realized APR = total rewards &divide; capital at work &times; 365 &divide; days in the window.</li>
+          </ol>
+          <p class="fine">Limits, stated plainly: capital at work is reconstructed from funds <b>the wallet itself</b> sends &mdash; deposits funded directly by a third party can't be attributed from transfer history alone. The figure is <b>rewards-only</b>: it measures reward payouts against capital at work, not total position P&amp;L (no impermanent loss, no in-pool fee accrual).</p>
+        </details>
+      </div>
+      <div>
+        <h4>Notes</h4>
+        <ul>
+          <li>Data: Blockscout (Base), Kraken (or Coinbase Exchange fallback) daily closes, Base public RPC &mdash; all client-side.</li>
+          <li>Analysis typically takes 20&ndash;60 seconds depending on wallet history.</li>
+          <li>Historical performance does not predict future returns. Not financial advice.</li>
+          <li>No analytics, no ad trackers. The email signup uses a Cloudflare Turnstile security check.</li>
+        </ul>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<script>
+/* Weekly digest signup — posts to the ryze-email Cloudflare Worker. */
+(function(){
+  var WORKER = 'https://ryze-email.hesham-99b.workers.dev';
+  var TS_SITEKEY = '0x4AAAAAAE_DsenivL35e_0q';
+  var tsWidgetId = null;
+  window.__ryzeTsOnload = function(){
+    try { tsWidgetId = turnstile.render('#tswidget', { sitekey: TS_SITEKEY }); }
+    catch (e) { /* Turnstile failed to load; submit will report it */ }
+  };
+  var addr = document.getElementById('addr');
+  var subwallet = document.getElementById('subwallet');
+  var subemail = document.getElementById('subemail');
+  var subgo = document.getElementById('subgo');
+  var submsg = document.getElementById('submsg');
+  function say(msg, ok){
+    submsg.textContent = msg;
+    submsg.style.color = ok ? 'var(--good)' : 'var(--bad)';
+  }
+  document.getElementById('subform').addEventListener('submit', async function(e){
+    e.preventDefault();
+    var email = subemail.value.trim().toLowerCase();
+    var wallet = (subwallet.value.trim() || (addr && addr.value.trim()) || '');
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { say('Enter a valid email address.', false); return; }
+    if (!/^0x[0-9a-fA-F]{40}$/.test(wallet)) { say('Enter a valid Base wallet address (0x + 40 hex chars).', false); return; }
+    var token = '';
+    try { token = (tsWidgetId !== null) ? turnstile.getResponse(tsWidgetId) : ''; } catch (err) {}
+    if (!token) { say('Please complete the security check first.', false); return; }
+    subgo.disabled = true;
+    say('Subscribing\u2026', true);
+    try {
+      var r = await fetch(WORKER + '/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email, wallet: wallet, turnstileToken: token })
+      });
+      var j = await r.json();
+      if (j.ok && j.updated) {
+        say('Done \u2014 this email was already subscribed, so we updated it to the new wallet. No confirmation needed.', true);
+      } else if (j.ok) {
+        say('Almost done \u2014 check your inbox for a confirmation email. You must click the link within 24 hours.', true);
+      } else if (j.error === 'turnstile-failed') {
+        say('Security check failed \u2014 please try again.', false);
+      } else {
+        say('Something went wrong (' + (j.error || 'unknown') + '). Please try again.', false);
+      }
+    } catch (err) {
+      say('Could not reach the subscription service. Check your connection and try again.', false);
+    }
+    try { if (tsWidgetId !== null) turnstile.reset(tsWidgetId); } catch (err) {}
+    subgo.disabled = false;
+  });
+})();
+</script>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=__ryzeTsOnload" async defer></script>
+<script>
+/*ENGINE_JS*/
+</script>
+<script>
+/*APP_JS*/
+</script>
+</body>
+</html>
