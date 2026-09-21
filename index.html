@@ -1294,8 +1294,16 @@ const RyzeEngine = (() => {
       barFill.style.width = '100%';
       pmsg.textContent = 'Done.';
       render(r);
+      // Digest hook (stable contract for the weekly-digest automation):
+      // the full analyze() result is exposed at window.__ryzeDigestResult and
+      // documentElement[data-digest-ready] flips to "1" (or "error" below).
+      // Empty/partial results are valid digest payloads too.
+      window.__ryzeDigestResult = r;
+      document.documentElement.dataset.digestReady = '1';
     } catch (err) {
       console.error(err);
+      window.__ryzeDigestError = (err && err.message) || 'network error';
+      document.documentElement.dataset.digestReady = 'error';
       if (err && err.message === 'invalid-address') {
         showError('Invalid address format.');
       } else if (err && /HTTP 429/.test(err.message || '')) {
@@ -1316,6 +1324,19 @@ const RyzeEngine = (() => {
       setTimeout(() => progressEl.classList.remove('on'), 1200);
     }
   });
+
+  // ?wallet=0x… autoplay: fills the address and runs the analysis on load.
+  // Used by the weekly-digest automation (headless browser); also handy for
+  // shared links. Only fires for a syntactically valid address.
+  try {
+    const q = (new URLSearchParams(location.search).get('wallet') || '').trim();
+    if (/^0x[0-9a-fA-F]{40}$/.test(q)) {
+      addrInput.value = q;
+      setTimeout(() => form.requestSubmit(), 300);
+    }
+  } catch {
+    /* malformed URL — ignore */
+  }
 })();
 
 </script>
