@@ -120,7 +120,6 @@
           <tr><td>APY (weekly-comp)</td><td>${p.principalKnown ? pct(p.apy) : '<span class="na">n/a</span>'}</td></tr>
           <tr><td>Total rewards</td><td>${money(p.rewards)}</td></tr>
           <tr><td>Total cost basis</td><td>${money(p.gross)}</td></tr>
-          <tr><td>Capital at work</td><td>${money(p.twap)}</td></tr>
           <tr><td>Current value</td><td>${money(p.curVal)}</td></tr>
           <tr><td>Claimed (${p.nClaims})</td><td>${money(p.claimed)}</td></tr>
           <tr><td>Unclaimed</td><td>${money(p.unclaimed)}</td></tr>
@@ -171,7 +170,6 @@
           <div class="stat"><div class="k">APY</div><div class="v">${b.principalKnown ? pct(b.apy) : 'n/a'}</div></div>
           <div class="stat"><div class="k">Rewards</div><div class="v">${money(b.rewards)}</div></div>
           <div class="stat"><div class="k">Total cost basis</div><div class="v">${money(b.gross)}</div></div>
-          <div class="stat"><div class="k">Capital at work</div><div class="v">${money(b.twap)}</div></div>
           <div class="stat"><div class="k">Current value</div><div class="v">${money(b.curVal)}</div></div>
         </div>
       </div>
