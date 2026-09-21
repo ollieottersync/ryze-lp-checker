@@ -689,6 +689,46 @@ const RyzeEngine = (() => {
       }
       return lo > 0 ? map[keys[lo - 1]] : 0;
     };
+    // Gross committed per pool + per-deposit detail for the "how is this
+    // calculated" breakdown. Each positive flow is valued at the close on
+    // its own day — the actual amount the wallet committed, BEFORE the
+    // protocol converts it into the pool position (zap swaps, fees, and
+    // dust happen after this point). A deposit's TWAP contribution is
+    // cost × (days it was in the pool) / total days — exact when the pool
+    // has no withdrawals; with withdrawals the TWAP reflects FIFO lot
+    // consumption instead.
+    const gross = { W: 0, B: 0 };
+    const depositDetail = [];
+    for (const f of flows) {
+      const costs = {};
+      let total = 0;
+      for (const t of TOKENS) {
+        const a = f.net[t] || 0;
+        if (a > 0) {
+          const px =
+            t === 'USDC'
+              ? 1
+              : closeAt(
+                  t === 'WETH' ? ETH : BTC,
+                  t === 'WETH' ? ethKeys : btcKeys,
+                  f.date
+                );
+          const c = r4(a * px);
+          costs[t] = { amt: r4(a), cost: c };
+          total = r4(total + c);
+        }
+      }
+      if (total > 0) {
+        gross[f.pool] = r4(gross[f.pool] + total);
+        depositDetail.push({
+          date: f.date,
+          pool: f.pool,
+          costs,
+          total,
+          daysActive: dayDiff(f.date, end) + 1,
+        });
+      }
+    }
     // Cost-basis principal per pool (USD), FIFO lots: each deposit pushes a
     // lot valued at the close on its own day (what the LP actually put in);
     // each withdrawal consumes the oldest lots first at their cost. The
@@ -743,6 +783,10 @@ const RyzeEngine = (() => {
       tw.B += principalOf('B');
       n++;
     }
+    // Per-deposit TWAP contributions, now that the window day-count is known.
+    for (const d of depositDetail) {
+      d.contrib = r4((d.total * d.daysActive) / n);
+    }
     // Current market value of what's still in the pool: remaining lot
     // amounts valued at the end-day close (PX holds the end date's prices
     // after the loop). Shown next to cost basis so the gap between the
@@ -759,6 +803,8 @@ const RyzeEngine = (() => {
       days: n,
       endBal: { W: principalOf('W'), B: principalOf('B') },
       curVal: { W: curVal('W'), B: curVal('B') },
+      gross,
+      depositDetail,
     };
   }
 
@@ -866,7 +912,18 @@ const RyzeEngine = (() => {
         },
       })),
     ];
-    const { twap, days, endBal, curVal } = buildSeries(genesis, flows, prices, firstDay, end);
+    const { twap, days, endBal, curVal, gross, depositDetail } = buildSeries(
+      genesis,
+      flows,
+      prices,
+      firstDay,
+      end
+    );
+
+    const wdByPool = { W: 0, B: 0 };
+    for (const wd of withdrawals) {
+      if (wdByPool[wd.pool] != null) wdByPool[wd.pool]++;
+    }
 
     const pools = {};
     for (const q of ['W', 'B']) {
@@ -879,6 +936,9 @@ const RyzeEngine = (() => {
         name: POOL_NAMES[q],
         rewards,
         twap: t,
+        gross: gross[q],
+        calc: depositDetail.filter((d) => d.pool === q),
+        calcExact: wdByPool[q] === 0,
         curVal: curVal[q],
         apr,
         apy: (1 + apr / 52) ** 52 - 1,
@@ -894,6 +954,7 @@ const RyzeEngine = (() => {
     const blended = {
       rewards: bRew,
       twap: bTwap,
+      gross: gross.W + gross.B,
       curVal: pools.W.curVal + pools.B.curVal,
       apr: bApr,
       apy: (1 + bApr / 52) ** 52 - 1,
