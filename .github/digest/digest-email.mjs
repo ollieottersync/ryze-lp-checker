@@ -69,7 +69,8 @@ function hero(b) {
 <table role="presentation" cellpadding="0" cellspacing="0"><tr>
 ${stat('APY', b.principalKnown ? pct(b.apy) : 'n/a')}
 ${stat('Rewards', money(b.rewards))}
-${stat('Cost basis', money(b.twap))}
+${stat('Total cost basis', money(b.gross))}
+${stat('Capital at work', money(b.twap))}
 ${stat('Current value', money(b.curVal))}
 </tr></table>
 </td></tr></table>`;
@@ -83,7 +84,7 @@ function poolCard(p) {
     : `<div style="font-size:24px;font-weight:400;color:#8a97a8;margin:2px 0 8px;">n/a</div>`;
   const note = p.principalKnown
     ? ''
-    : `<div style="font-size:12px;color:#8a97a8;margin-top:8px;">Cost basis not detected for this pool, so APR/APY can't be computed.</div>`;
+    : `<div style="font-size:12px;color:#8a97a8;margin-top:8px;">Capital at work couldn't be measured for this pool, so APR/APY can't be computed.</div>`;
   return `<td width="50%" valign="top" style="padding:0 6px;">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td style="background:#ffffff;border:1px solid #e3e9f0;border-radius:14px;padding:16px;">
 <div style="font-size:15px;font-weight:700;">${esc(p.name)}</div>
@@ -91,7 +92,8 @@ ${aprLine}
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
 ${row('APY (weekly-comp)', p.principalKnown ? pct(p.apy) : '<span style="color:#8a97a8;">n/a</span>')}
 ${row('Total rewards', money(p.rewards))}
-${row('Cost basis', money(p.twap))}
+${row('Total cost basis', money(p.gross))}
+${row('Capital at work', money(p.twap))}
 ${row('Current value', money(p.curVal))}
 ${row(`Claimed (${p.nClaims})`, money(p.claimed))}
 ${row('Unclaimed', money(p.unclaimed))}
@@ -99,6 +101,35 @@ ${row('Unclaimed', money(p.unclaimed))}
 ${note}
 </td></tr></table>
 </td>`;
+}
+
+const prettyDate = (d) => {
+  try {
+    return new Date(d + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  } catch {
+    return d;
+  }
+};
+
+// Static "how this is calculated" block (<details> is unreliable in email
+// clients, so the breakdown renders expanded).
+function calcBlock(r) {
+  const secs = ['W', 'B'].map((q) => {
+    const p = r.pools[q];
+    if (!p.calc || !p.calc.length) return '';
+    const lines = p.calc.map((d) =>
+      `<tr><td style="padding:2px 0;font-size:12px;color:#5b6b80;">${money(d.total)} on ${prettyDate(d.date)} &times; ${d.daysActive}/${r.days} days</td><td align="right" style="padding:2px 0;font-size:12px;font-weight:600;">${money(d.contrib)}</td></tr>`
+    ).join('');
+    const note = p.calcExact
+      ? `Adds up to the ${money(p.twap)} capital at work. APR divides rewards by capital at work, not by total cost basis &mdash; money only counts for the days it was in the pool.`
+      : `This pool has withdrawals, so its capital-at-work figure reflects FIFO lot accounting &mdash; deposits show what went in and when.`;
+    return `<div style="font-size:13px;font-weight:700;margin:10px 0 2px;">${esc(p.name)}</div>` +
+      `<div style="font-size:12px;color:#5b6b80;">Total cost basis <b style="color:#16202e;">${money(p.gross)}</b> &rarr; capital at work <b style="color:#16202e;">${money(p.twap)}</b></div>` +
+      `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:4px;">${lines}</table>` +
+      `<div style="font-size:11px;color:#8a97a8;margin-top:2px;">${note}</div>`;
+  }).filter(Boolean).join('');
+  if (!secs) return '';
+  return `<div style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#5b6b80;margin-top:10px;">How this is calculated</div>${secs}`;
 }
 
 function metaLine(r) {
@@ -118,7 +149,8 @@ function metaLine(r) {
   return `${warn}
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td style="background:#ffffff;border:1px solid #e3e9f0;border-radius:14px;padding:14px 16px;">
 <div style="font-size:13px;color:#5b6b80;line-height:2;">${bits.join(' &nbsp;&middot;&nbsp; ')}</div>
-<div style="font-size:12px;color:#8a97a8;margin-top:8px;line-height:1.6;">Cost basis is what you put in, priced on deposit day. Market moves never change it, so the APR is pure yield, not price appreciation. Current value is what's still in the pool at today's prices &mdash; the gap between the two is market gain or loss.</div>
+<div style="font-size:12px;color:#8a97a8;margin-top:8px;line-height:1.6;">Total cost basis is the actual amount that went in, before the protocol converted it into the pool position &mdash; the purest comparable figure, since Ryze pools aren't 50/50 and the converted split differs with every deposit. Capital at work is the time-weighted capital the APR is figured on &mdash; a deposit made later in the window counts for fewer days, which is why it can read lower than total cost basis. (Converting the deposit into the pool position also costs a small amount in swap fees &mdash; typically a few dollars per deposit.) Market moves never change either number, so the APR is pure yield, not price appreciation. Current value is what's still in the pool at today's prices &mdash; the gap between the two is market gain or loss.</div>
+${calcBlock(r)}
 ${priceNote}
 </td></tr></table>`;
 }
@@ -129,7 +161,7 @@ function fullEmail(r, ctx) {
   const b = r.blended;
   const period = `${r.firstDay} &rarr; ${r.end} (${r.days} days)`;
   const subject = 'Your weekly Ryze LP digest — ' +
-    (b.principalKnown ? pct(b.apr) + ' APR' : 'no cost basis detected');
+    (b.principalKnown ? pct(b.apr) + ' APR' : 'capital at work not detected');
   const bodyHtml = header(r.wallet, `${r.firstDay} → ${r.end} (${r.days} days)`) +
     `<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td style="padding-bottom:12px;">${hero(b)}</td></tr></table>` +
     `<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>${poolCard(r.pools.W)}${poolCard(r.pools.B)}</tr></table>` +
@@ -138,15 +170,22 @@ function fullEmail(r, ctx) {
 
   const poolText = (p) =>
     p.principalKnown
-      ? `${p.name}: ${pct(p.apr)} APR (${pct(p.apy)} APY) — ${money(p.rewards)} rewards on ${money(p.twap)} cost basis; current value ${money(p.curVal)}`
-      : `${p.name}: n/a — cost basis not detected (${money(p.rewards)} rewards)`;
+      ? `${p.name}: ${pct(p.apr)} APR (${pct(p.apy)} APY) — ${money(p.rewards)} rewards; ${money(p.gross)} total cost basis, ${money(p.twap)} capital at work; current value ${money(p.curVal)}`
+      : `${p.name}: n/a — capital at work not detected (${money(p.rewards)} rewards)`;
+  const calcText = (p) => {
+    if (!p.calc || !p.calc.length) return '';
+    const lines = p.calc.map((d) =>
+      `  ${money(d.total)} on ${d.date} x ${d.daysActive}/${r.days} days = ${money(d.contrib)}`
+    ).join('\n');
+    return `\n  How calculated (${p.name}):\n${lines}\n  -> capital at work ${money(p.twap)}${p.calcExact ? '' : ' (FIFO, has withdrawals)'}`;
+  };
   const text =
     `Your weekly Ryze LP digest\n${r.firstDay} → ${r.end} (${r.days} days)\nWallet: ${r.wallet}\n\n` +
-    `Blended: ${b.principalKnown ? pct(b.apr) + ' APR (' + pct(b.apy) + ' APY)' : 'n/a — cost basis not detected'}\n` +
-    `Cost basis: ${money(b.twap)}    Current value: ${money(b.curVal)}\n` +
+    `Blended: ${b.principalKnown ? pct(b.apr) + ' APR (' + pct(b.apy) + ' APY)' : 'n/a — capital at work not detected'}\n` +
+    `Total cost basis: ${money(b.gross)}    Capital at work: ${money(b.twap)}    Current value: ${money(b.curVal)}\n` +
     `Total rewards: ${money(b.rewards)} (claimed ${money(r.pools.W.claimed + r.pools.B.claimed)} + unclaimed ${money(r.pools.W.unclaimed + r.pools.B.unclaimed)})\n\n` +
-    poolText(r.pools.W) + '\n' + poolText(r.pools.B) + '\n\n' +
-    `Method: FIFO cost basis — what you put in, priced on deposit day. Market moves never change it, so the APR is pure yield, not price appreciation.` +
+    poolText(r.pools.W) + calcText(r.pools.W) + '\n' + poolText(r.pools.B) + calcText(r.pools.B) + '\n\n' +
+    `Method: total cost basis is the actual amount committed, before the protocol converts it into the pool position. Capital at work time-weights that over the window, and the APR is figured on capital at work. Market moves never change either number, so the APR is pure yield, not price appreciation.` +
     (ctx.unsubUrl ? `\n\nUnsubscribe: ${ctx.unsubUrl}` : '');
   return { subject, text, html };
 }
@@ -162,13 +201,13 @@ function partialEmail(r, ctx) {
 <tr><td style="padding:4px 0;font-size:14px;color:#5b6b80;">WETH-USDC</td><td align="right" style="font-size:14px;font-weight:700;">${money(wU)} unclaimed</td></tr>
 <tr><td style="padding:4px 0;font-size:14px;color:#5b6b80;">cbBTC-USDC</td><td align="right" style="font-size:14px;font-weight:700;">${money(bU)} unclaimed</td></tr>
 </table>
-<div style="font-size:13px;color:#8a97a8;margin-top:10px;">Cost basis and APR need visible deposit history, so those are skipped this week.</div>
+<div style="font-size:13px;color:#8a97a8;margin-top:10px;">Capital at work and APR need visible deposit history, so those are skipped this week.</div>
 </td></tr></table>`;
   const html = wrap({ subject, preheader: `${money(wU + bU)} in unclaimed rewards`, bodyHtml, unsubUrl: ctx.unsubUrl });
   const text =
     `Your weekly Ryze LP digest\n\nNo deposit/withdrawal history was found for ${r.wallet}, but there are unclaimed rewards sitting in the pools:\n\n` +
     `WETH-USDC: ${money(wU)} unclaimed\ncbBTC-USDC: ${money(bU)} unclaimed\n\n` +
-    `Cost basis and APR need visible deposit history, so those are skipped this week.` +
+    `Capital at work and APR need visible deposit history, so those are skipped this week.` +
     (ctx.unsubUrl ? `\n\nUnsubscribe: ${ctx.unsubUrl}` : '');
   return { subject, text, html };
 }
