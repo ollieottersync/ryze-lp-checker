@@ -106,7 +106,7 @@
 
   <div class="card" id="subcard">
     <h2 style="margin:0 0 6px;font-size:1.15rem">Get the weekly digest</h2>
-    <p class="sub" style="margin-bottom:14px">One email every Monday with this wallet's realized APR, cost basis, current value, and rewards. Double opt-in &mdash; confirm via the email we send you. Unsubscribe anytime.</p>
+    <p class="sub" style="margin-bottom:14px">One email every Monday with this wallet's realized APR, total cost basis, capital at work, current value, and rewards. Double opt-in &mdash; confirm via the email we send you. Unsubscribe anytime.</p>
     <form id="subform" autocomplete="off">
       <label for="subemail">Email</label>
       <input type="text" id="subemail" name="subemail" spellcheck="false" placeholder="you@example.com" style="margin-bottom:12px">
@@ -125,23 +125,24 @@
       <div>
         <h4>Methodology</h4>
         <ul>
-          <li>Cost basis = FIFO cost basis of what's in the pool: each deposit is valued at that day's close (Kraken daily closes, USDC = $1); withdrawals consume the oldest lots first at their original cost. Market moves after a deposit never change cost basis.</li>
-          <li>Current value = what's still in the pool at today's closes. The gap between current value and cost basis is market gain or loss.</li>
+          <li>Total cost basis = the actual amount the wallet committed, valued on deposit day &mdash; what went in <i>before</i> the protocol converted it into the pool position. The purest comparable figure: Ryze pools aren't 50/50, so the converted split differs with every deposit. Capital at work time-weights that over the window (a deposit made later counts for fewer days), which is why it can read lower than total cost basis. The APR is always figured on capital at work.</li>
+          <li>Capital at work = FIFO cost basis of what's in the pool, averaged over the window: each deposit is valued at that day's close (Kraken daily closes, USDC = $1); withdrawals consume the oldest lots first at their original cost. Market moves after a deposit never change it.</li>
+          <li>Current value = what's still in the pool at today's closes. The gap between current value and capital at work is market gain or loss.</li>
           <li>Deposits: transactions where the wallet sends USDC/WETH/cbBTC and the same transaction deposits LP into a Ryze pool. Plain swaps excluded; dust returned to the wallet is netted off.</li>
           <li>Withdrawals: transactions that burn pool LP with underlying returned to the wallet.</li>
           <li>Rewards = claimed (pool &rarr; wallet USDC transfers) + unclaimed (read live from each pool's claimable-rewards view).</li>
-          <li>Realized APR = rewards &divide; cost basis &times; 365/days (cost basis is the time-weighted average over the window). APY = (1+APR/52)<sup>52</sup>&minus;1 (weekly compounding).</li>
+          <li>Realized APR = rewards &divide; capital at work &times; 365/days (capital at work is the time-weighted average over the window; total cost basis is shown alongside so you can see what actually went in). APY = (1+APR/52)<sup>52</sup>&minus;1 (weekly compounding).</li>
         </ul>
         <details class="deet">
-          <summary>How cost basis is computed, step by step</summary>
+          <summary>How capital at work is computed, step by step</summary>
           <ol>
-            <li><b>Find the flows.</b> Every deposit and withdrawal becomes a dated entry: date, pool, and token amounts (USDC / WETH / cbBTC). Claims never touch cost basis.</li>
+            <li><b>Find the flows.</b> Every deposit and withdrawal becomes a dated entry: date, pool, and token amounts (USDC / WETH / cbBTC). Claims never touch capital at work.</li>
             <li><b>Pool migrations net out.</b> When a withdrawal is followed within 2 days by deposits into the same pool (e.g. a pool migration: withdraw from the old pool, deposit into the new one), the pair is netted to its capital delta &mdash; only genuinely new money counts as a deposit.</li>
             <li><b>Build FIFO lots, day by day.</b> Starting from the first activity day through today, each day's deposits push a cost-basis lot valued at that day's close (USDC at $1, WETH at the ETH close, cbBTC at the BTC close &mdash; Kraken daily closes, Coinbase Exchange fallback). Each day's withdrawals consume the oldest lots first at their original cost. Cost basis can never go negative.</li>
-            <li><b>Time-weight it.</b> Cost basis is the average of the daily cost-basis balances, per pool. The blended figure is the sum of both pools. Because each lot carries its deposit-day price, market moves after a flow never change cost basis &mdash; so the APR is pure yield, not price appreciation.</li>
-            <li><b>Divide rewards by cost basis.</b> Realized APR = total rewards &divide; cost basis &times; 365 &divide; days in the window.</li>
+            <li><b>Time-weight it.</b> Capital at work is the average of the daily cost-basis balances, per pool. The blended figure is the sum of both pools. Because each lot carries its deposit-day price, market moves after a flow never change it &mdash; so the APR is pure yield, not price appreciation.</li>
+            <li><b>Divide rewards by capital at work.</b> Realized APR = total rewards &divide; capital at work &times; 365 &divide; days in the window.</li>
           </ol>
-          <p class="fine">Limits, stated plainly: cost basis is reconstructed from funds <b>the wallet itself</b> sends &mdash; deposits funded directly by a third party can't be attributed from transfer history alone. The figure is <b>rewards-only</b>: it measures reward payouts against cost basis, not total position P&amp;L (no impermanent loss, no in-pool fee accrual).</p>
+          <p class="fine">Limits, stated plainly: capital at work is reconstructed from funds <b>the wallet itself</b> sends &mdash; deposits funded directly by a third party can't be attributed from transfer history alone. The figure is <b>rewards-only</b>: it measures reward payouts against capital at work, not total position P&amp;L (no impermanent loss, no in-pool fee accrual).</p>
         </details>
       </div>
       <div>
@@ -904,6 +905,46 @@ const RyzeEngine = (() => {
       }
       return lo > 0 ? map[keys[lo - 1]] : 0;
     };
+    // Gross committed per pool + per-deposit detail for the "how is this
+    // calculated" breakdown. Each positive flow is valued at the close on
+    // its own day — the actual amount the wallet committed, BEFORE the
+    // protocol converts it into the pool position (zap swaps, fees, and
+    // dust happen after this point). A deposit's TWAP contribution is
+    // cost × (days it was in the pool) / total days — exact when the pool
+    // has no withdrawals; with withdrawals the TWAP reflects FIFO lot
+    // consumption instead.
+    const gross = { W: 0, B: 0 };
+    const depositDetail = [];
+    for (const f of flows) {
+      const costs = {};
+      let total = 0;
+      for (const t of TOKENS) {
+        const a = f.net[t] || 0;
+        if (a > 0) {
+          const px =
+            t === 'USDC'
+              ? 1
+              : closeAt(
+                  t === 'WETH' ? ETH : BTC,
+                  t === 'WETH' ? ethKeys : btcKeys,
+                  f.date
+                );
+          const c = r4(a * px);
+          costs[t] = { amt: r4(a), cost: c };
+          total = r4(total + c);
+        }
+      }
+      if (total > 0) {
+        gross[f.pool] = r4(gross[f.pool] + total);
+        depositDetail.push({
+          date: f.date,
+          pool: f.pool,
+          costs,
+          total,
+          daysActive: dayDiff(f.date, end) + 1,
+        });
+      }
+    }
     // Cost-basis principal per pool (USD), FIFO lots: each deposit pushes a
     // lot valued at the close on its own day (what the LP actually put in);
     // each withdrawal consumes the oldest lots first at their cost. The
@@ -958,6 +999,10 @@ const RyzeEngine = (() => {
       tw.B += principalOf('B');
       n++;
     }
+    // Per-deposit TWAP contributions, now that the window day-count is known.
+    for (const d of depositDetail) {
+      d.contrib = r4((d.total * d.daysActive) / n);
+    }
     // Current market value of what's still in the pool: remaining lot
     // amounts valued at the end-day close (PX holds the end date's prices
     // after the loop). Shown next to cost basis so the gap between the
@@ -974,6 +1019,8 @@ const RyzeEngine = (() => {
       days: n,
       endBal: { W: principalOf('W'), B: principalOf('B') },
       curVal: { W: curVal('W'), B: curVal('B') },
+      gross,
+      depositDetail,
     };
   }
 
@@ -1081,7 +1128,18 @@ const RyzeEngine = (() => {
         },
       })),
     ];
-    const { twap, days, endBal, curVal } = buildSeries(genesis, flows, prices, firstDay, end);
+    const { twap, days, endBal, curVal, gross, depositDetail } = buildSeries(
+      genesis,
+      flows,
+      prices,
+      firstDay,
+      end
+    );
+
+    const wdByPool = { W: 0, B: 0 };
+    for (const wd of withdrawals) {
+      if (wdByPool[wd.pool] != null) wdByPool[wd.pool]++;
+    }
 
     const pools = {};
     for (const q of ['W', 'B']) {
@@ -1094,6 +1152,9 @@ const RyzeEngine = (() => {
         name: POOL_NAMES[q],
         rewards,
         twap: t,
+        gross: gross[q],
+        calc: depositDetail.filter((d) => d.pool === q),
+        calcExact: wdByPool[q] === 0,
         curVal: curVal[q],
         apr,
         apy: (1 + apr / 52) ** 52 - 1,
@@ -1109,6 +1170,7 @@ const RyzeEngine = (() => {
     const blended = {
       rewards: bRew,
       twap: bTwap,
+      gross: gross.W + gross.B,
       curVal: pools.W.curVal + pools.B.curVal,
       apr: bApr,
       apy: (1 + bApr / 52) ** 52 - 1,
@@ -1156,7 +1218,64 @@ const RyzeEngine = (() => {
     String(s).replace(/[&<>"']/g, (c) => ({
       '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
     })[c]);
-  const shortAddr = (a) => a.slice(0, 6) + '…' + a.slice(-6);
+  const prettyDate = (d) => {
+    try {
+      return new Date(d + 'T12:00:00').toLocaleDateString('en-US', {
+        month: 'short',
+        day: 'numeric',
+      });
+    } catch {
+      return d;
+    }
+  };
+
+  // "See how this is calculated" expander: per-pool deposit math.
+  function calcDetails(r) {
+    const secs = ['W', 'B']
+      .map((q) => {
+        const p = r.pools[q];
+        if (!p.calc || !p.calc.length) return '';
+        const lines = p.calc
+          .map(
+            (d) =>
+              `<li>${money(d.total)} deposited ${prettyDate(d.date)} &times; ` +
+              `${d.daysActive}/${r.days} days = <b>${money(d.contrib)}</b></li>`
+          )
+          .join('');
+        const note = p.calcExact
+          ? `Adds up to the ${money(p.twap)} capital at work. The APR divides ` +
+            `rewards by capital at work, not by total cost basis &mdash; money only ` +
+            `counts for the days it was actually in the pool.`
+          : `This pool has withdrawals, so its capital-at-work figure reflects FIFO lot ` +
+            `accounting rather than the simple sum above &mdash; the deposits ` +
+            `show what went in and when.`;
+        return `<h4 style="margin:10px 0 4px;font-size:0.85rem">${esc(p.name)}</h4>` +
+          `<p style="margin:0 0 4px">Total cost basis <b>${money(p.gross)}</b> ` +
+          `&rarr; capital at work <b>${money(p.twap)}</b></p>` +
+          `<ul style="margin:4px 0;padding-left:20px">${lines}</ul>` +
+          `<p class="fine" style="margin:4px 0 0">${note}</p>`;
+      })
+      .filter(Boolean)
+      .join('');
+    if (!secs) return '';
+    return `
+      <details class="deet">
+        <summary>See how this is calculated</summary>
+        <div style="padding:2px 14px 12px;font-size:0.82rem">
+          ${secs}
+          <p class="fine" style="margin:10px 0 0">Total cost basis is the actual amount ` +
+      `that went in, before the protocol converted it into the pool position &mdash; ` +
+      `the purest comparable figure, since Ryze pools aren't 50/50 and the converted ` +
+      `split differs with every deposit. Capital at work is the time-weighted capital ` +
+      `the APR is figured on: a deposit made later in the window counts for fewer days, ` +
+      `which is why it can read lower than total cost basis. (Converting the deposit ` +
+      `into the pool position also costs a small amount in swap fees &mdash; typically ` +
+      `a few dollars per deposit.) Market moves never change either number, so the APR ` +
+      `is pure yield, not price appreciation. Current value is what's still in the pool ` +
+      `at today's prices &mdash; the gap between the two is market gain or loss.</p>
+        </div>
+      </details>`;
+  }
 
   // stage -> [from%, to%]
   const STAGES = {
@@ -1192,7 +1311,7 @@ const RyzeEngine = (() => {
       : `<div class="apr na">n/a</div>`;
     const note = p.principalKnown
       ? ''
-      : `<div class="hint">Cost basis not detected for this pool, so APR/APY can't be computed.</div>`;
+      : `<div class="hint">Capital at work couldn't be measured for this pool, so APR/APY can't be computed.</div>`;
     return `
       <div class="pool">
         <h3>${esc(p.name)}</h3>
@@ -1200,7 +1319,8 @@ const RyzeEngine = (() => {
         <table>
           <tr><td>APY (weekly-comp)</td><td>${p.principalKnown ? pct(p.apy) : '<span class="na">n/a</span>'}</td></tr>
           <tr><td>Total rewards</td><td>${money(p.rewards)}</td></tr>
-          <tr><td>Cost basis</td><td>${money(p.twap)}</td></tr>
+          <tr><td>Total cost basis</td><td>${money(p.gross)}</td></tr>
+          <tr><td>Capital at work</td><td>${money(p.twap)}</td></tr>
           <tr><td>Current value</td><td>${money(p.curVal)}</td></tr>
           <tr><td>Claimed (${p.nClaims})</td><td>${money(p.claimed)}</td></tr>
           <tr><td>Unclaimed</td><td>${money(p.unclaimed)}</td></tr>
@@ -1250,7 +1370,8 @@ const RyzeEngine = (() => {
         <div class="row2">
           <div class="stat"><div class="k">APY</div><div class="v">${b.principalKnown ? pct(b.apy) : 'n/a'}</div></div>
           <div class="stat"><div class="k">Rewards</div><div class="v">${money(b.rewards)}</div></div>
-          <div class="stat"><div class="k">Cost basis</div><div class="v">${money(b.twap)}</div></div>
+          <div class="stat"><div class="k">Total cost basis</div><div class="v">${money(b.gross)}</div></div>
+          <div class="stat"><div class="k">Capital at work</div><div class="v">${money(b.twap)}</div></div>
           <div class="stat"><div class="k">Current value</div><div class="v">${money(b.curVal)}</div></div>
         </div>
       </div>
@@ -1266,10 +1387,7 @@ const RyzeEngine = (() => {
           <span>Withdrawals <b>${r.withdrawals}</b></span>
           ${r.migrations ? `<span>Pool migrations netted <b>${r.migrations}</b></span>` : ''}
         </div>
-        <div class="hint">Cost basis is what you put in, priced on deposit day.
-          Market moves never change it, so the APR is pure yield, not price
-          appreciation. Current value is what's still in the pool at today's
-          prices — the gap between the two is market gain or loss.</div>
+        ${calcDetails(r)}
         ${priceNote}
       </div>`;
     resultsEl.classList.add('on');
