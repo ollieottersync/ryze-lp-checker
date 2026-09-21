@@ -170,6 +170,7 @@ const RyzeEngine = (() => {
   const BLOCKSCOUT = 'https://base.blockscout.com/api/v2';
   const KRAKEN = 'https://api.kraken.com/0/public/OHLC';
   const RPCS = [
+    'https://rpc-base.ottersync.io/', // team's own Ottersync node — first priority
     'https://base.drpc.org',
     'https://1rpc.io/base',
     'https://mainnet.base.org',
@@ -207,9 +208,37 @@ const RyzeEngine = (() => {
   // ------------------------------------------------------------- helpers --
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  async function fetchJSON(url, { postData = null, timeout = 30000, tries = 3 } = {}) {
+  // Optional hook so the UI can tell the visitor what's happening during
+  // retries (e.g. "Blockscout rate-limited us — backing off…"). Set via
+  // RyzeEngine.setRetryHook(fn); cleared by passing null.
+  let _retryHook = null;
+  function setRetryHook(fn) {
+    _retryHook = typeof fn === 'function' ? fn : null;
+  }
+  function noteRetry(msg) {
+    try {
+      if (_retryHook) _retryHook(msg);
+    } catch {
+      /* hook must never break the fetch path */
+    }
+  }
+
+  // Blockscout's public API rate-limits burst traffic (HTTP 429). Serialize
+  // Blockscout requests behind a small pacing gate (~1 request per 300ms)
+  // so the page stays comfortably under the limit instead of tripping it.
+  // Other hosts (Kraken, Coinbase, RPCs) are unaffected.
+  let _bsGate = Promise.resolve();
+  function paceBlockscout(url) {
+    if (!url.startsWith(BLOCKSCOUT)) return Promise.resolve();
+    const wait = _bsGate.then(() => sleep(300));
+    _bsGate = wait.catch(() => {});
+    return wait;
+  }
+
+  async function fetchJSON(url, { postData = null, timeout = 30000, tries = 5 } = {}) {
     let lastErr = null;
     for (let i = 0; i < tries; i++) {
+      await paceBlockscout(url);
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), timeout);
       try {
@@ -220,6 +249,21 @@ const RyzeEngine = (() => {
           signal: ctrl.signal,
         });
         clearTimeout(t);
+        if (res.status === 429 || res.status === 503) {
+          // Rate-limited (or temporarily unavailable): honor the server's
+          // Retry-After when present, otherwise back off exponentially
+          // with jitter. These are transient — keep trying quietly.
+          const ra = parseFloat(res.headers.get('Retry-After'));
+          const waitMs = Number.isFinite(ra) && ra >= 0
+            ? ra * 1000 + Math.random() * 500
+            : Math.min(30000, 2000 * 2 ** i) + Math.random() * 1000;
+          lastErr = new Error(`HTTP ${res.status} for ${url.slice(0, 80)}`);
+          noteRetry(
+            `Rate-limited by the data API — backing off ${Math.round(waitMs / 1000)}s before retrying…`
+          );
+          await sleep(waitMs);
+          continue;
+        }
         if (!res.ok) throw new Error(`HTTP ${res.status} for ${url.slice(0, 80)}`);
         return await res.json();
       } catch (e) {
@@ -727,7 +771,7 @@ const RyzeEngine = (() => {
     };
   }
 
-  return { analyze, POOL_NAMES };
+  return { analyze, POOL_NAMES, setRetryHook };
 })();
 
 
@@ -877,6 +921,8 @@ const RyzeEngine = (() => {
     goBtn.disabled = true;
     progressEl.classList.add('on');
     barFill.style.width = '0%';
+    // Surface rate-limit backoff in the progress line instead of stalling silently.
+    RyzeEngine.setRetryHook((msg) => { pmsg.textContent = msg; });
     try {
       const r = await RyzeEngine.analyze(wallet, { onProgress: setProgress });
       barFill.style.width = '100%';
@@ -886,6 +932,11 @@ const RyzeEngine = (() => {
       console.error(err);
       if (err && err.message === 'invalid-address') {
         showError('Invalid address format.');
+      } else if (err && /HTTP 429/.test(err.message || '')) {
+        showError(
+          'Blockscout is rate-limiting requests right now. Wait a minute and try again — ' +
+          'the page backs off and retries automatically, but the limit can persist under heavy use.'
+        );
       } else {
         showError(
           'Something went wrong while fetching data (' +
@@ -894,6 +945,7 @@ const RyzeEngine = (() => {
         );
       }
     } finally {
+      RyzeEngine.setRetryHook(null);
       goBtn.disabled = false;
       setTimeout(() => progressEl.classList.remove('on'), 1200);
     }
