@@ -743,10 +743,22 @@ const RyzeEngine = (() => {
       tw.B += principalOf('B');
       n++;
     }
+    // Current market value of what's still in the pool: remaining lot
+    // amounts valued at the end-day close (PX holds the end date's prices
+    // after the loop). Shown next to cost basis so the gap between the
+    // two reads as market gain/loss at a glance.
+    const curVal = (pool) =>
+      r4(
+        TOKENS.reduce(
+          (s, t) => s + lots[pool][t].reduce((a, l) => a + l.amt, 0) * PX[t],
+          0
+        )
+      );
     return {
       twap: { W: tw.W / n, B: tw.B / n },
       days: n,
       endBal: { W: principalOf('W'), B: principalOf('B') },
+      curVal: { W: curVal('W'), B: curVal('B') },
     };
   }
 
@@ -841,7 +853,7 @@ const RyzeEngine = (() => {
     const prices = { ETH, BTC };
     const priceSource = ETH.src === BTC.src ? ETH.src : `${ETH.src} / ${BTC.src}`;
 
-    prog('compute', 0, 1, 'Computing time-weighted principal…');
+    prog('compute', 0, 1, 'Computing cost basis…');
     const flows = [
       ...netDeposits.map((d) => ({ date: d.date, pool: d.pool, net: d.net })),
       ...withdrawals.map((d) => ({
@@ -854,7 +866,7 @@ const RyzeEngine = (() => {
         },
       })),
     ];
-    const { twap, days, endBal } = buildSeries(genesis, flows, prices, firstDay, end);
+    const { twap, days, endBal, curVal } = buildSeries(genesis, flows, prices, firstDay, end);
 
     const pools = {};
     for (const q of ['W', 'B']) {
@@ -867,6 +879,7 @@ const RyzeEngine = (() => {
         name: POOL_NAMES[q],
         rewards,
         twap: t,
+        curVal: curVal[q],
         apr,
         apy: (1 + apr / 52) ** 52 - 1,
         claimed,
@@ -881,6 +894,7 @@ const RyzeEngine = (() => {
     const blended = {
       rewards: bRew,
       twap: bTwap,
+      curVal: pools.W.curVal + pools.B.curVal,
       apr: bApr,
       apy: (1 + bApr / 52) ** 52 - 1,
       principalKnown: bTwap > 0,

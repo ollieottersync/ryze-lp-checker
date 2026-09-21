@@ -54,7 +54,7 @@
       : `<div class="apr na">n/a</div>`;
     const note = p.principalKnown
       ? ''
-      : `<div class="hint">Principal not detected for this pool, so APR/APY can't be computed.</div>`;
+      : `<div class="hint">Cost basis not detected for this pool, so APR/APY can't be computed.</div>`;
     return `
       <div class="pool">
         <h3>${esc(p.name)}</h3>
@@ -62,7 +62,8 @@
         <table>
           <tr><td>APY (weekly-comp)</td><td>${p.principalKnown ? pct(p.apy) : '<span class="na">n/a</span>'}</td></tr>
           <tr><td>Total rewards</td><td>${money(p.rewards)}</td></tr>
-          <tr><td>Time-weighted principal (cost basis)</td><td>${money(p.twap)}</td></tr>
+          <tr><td>Cost basis</td><td>${money(p.twap)}</td></tr>
+          <tr><td>Current value</td><td>${money(p.curVal)}</td></tr>
           <tr><td>Claimed (${p.nClaims})</td><td>${money(p.claimed)}</td></tr>
           <tr><td>Unclaimed</td><td>${money(p.unclaimed)}</td></tr>
         </table>
@@ -111,7 +112,8 @@
         <div class="row2">
           <div class="stat"><div class="k">APY</div><div class="v">${b.principalKnown ? pct(b.apy) : 'n/a'}</div></div>
           <div class="stat"><div class="k">Rewards</div><div class="v">${money(b.rewards)}</div></div>
-          <div class="stat"><div class="k">Principal (cost basis, time-wtd)</div><div class="v">${money(b.twap)}</div></div>
+          <div class="stat"><div class="k">Cost basis</div><div class="v">${money(b.twap)}</div></div>
+          <div class="stat"><div class="k">Current value</div><div class="v">${money(b.curVal)}</div></div>
         </div>
       </div>
       <div class="pools">
@@ -126,9 +128,10 @@
           <span>Withdrawals <b>${r.withdrawals}</b></span>
           ${r.migrations ? `<span>Pool migrations netted <b>${r.migrations}</b></span>` : ''}
         </div>
-        <div class="hint">Principal is your cost basis — what you put in, valued at
-          deposit-day prices. Market moves never change it, so the APR is pure
-          yield, not price appreciation.</div>
+        <div class="hint">Cost basis is what you put in, priced on deposit day.
+          Market moves never change it, so the APR is pure yield, not price
+          appreciation. Current value is what's still in the pool at today's
+          prices — the gap between the two is market gain or loss.</div>
         ${priceNote}
       </div>`;
     resultsEl.classList.add('on');
