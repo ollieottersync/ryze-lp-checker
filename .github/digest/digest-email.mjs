@@ -70,7 +70,7 @@ function hero(b) {
 ${stat('APY', b.principalKnown ? pct(b.apy) : 'n/a')}
 ${stat('Rewards', money(b.rewards))}
 ${stat('Total cost basis', money(b.gross))}
-${stat('Current value', money(b.curVal))}
+${stat(b.liveValue ? 'Current value' : 'Current value (est.)', money(b.curVal))}
 </tr></table>
 </td></tr></table>`;
 }
@@ -92,7 +92,7 @@ ${aprLine}
 ${row('APY (weekly-comp)', p.principalKnown ? pct(p.apy) : '<span style="color:#8a97a8;">n/a</span>')}
 ${row('Total rewards', money(p.rewards))}
 ${row('Total cost basis', money(p.gross))}
-${row('Current value', money(p.curVal))}
+${row(p.liveValue ? 'Current value' : 'Current value (est.)', money(p.curVal))}
 ${row(`Claimed (${p.nClaims})`, money(p.claimed))}
 ${row('Unclaimed', money(p.unclaimed))}
 </table>
@@ -147,7 +147,7 @@ function metaLine(r) {
   return `${warn}
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td style="background:#ffffff;border:1px solid #e3e9f0;border-radius:14px;padding:14px 16px;">
 <div style="font-size:13px;color:#5b6b80;line-height:2;">${bits.join(' &nbsp;&middot;&nbsp; ')}</div>
-<div style="font-size:12px;color:#8a97a8;margin-top:8px;line-height:1.6;">Total cost basis is the actual amount that went in, before the protocol converted it into the pool position &mdash; the purest comparable figure, since Ryze pools aren't 50/50 and the converted split differs with every deposit. Capital at work is the time-weighted capital the APR is figured on &mdash; a deposit made later in the window counts for fewer days, which is why it can read lower than total cost basis. (Converting the deposit into the pool position also costs a small amount in swap fees &mdash; typically a few dollars per deposit.) Market moves never change either number, so the APR is pure yield, not price appreciation. Current value is what's still in the pool at today's prices &mdash; the gap between the two is market gain or loss.</div>
+<div style="font-size:12px;color:#8a97a8;margin-top:8px;line-height:1.6;">Total cost basis is the actual amount that went in, before the protocol converted it into the pool position &mdash; the purest comparable figure, since Ryze pools aren't 50/50 and the converted split differs with every deposit. Capital at work is the time-weighted capital the APR is figured on &mdash; a deposit made later in the window counts for fewer days, which is why it can read lower than total cost basis. (Converting the deposit into the pool position also costs a small amount in swap fees &mdash; typically a few dollars per deposit.) Market moves never change either number, so the APR is pure yield, not price appreciation. Current value is read live from each pool's staking gauge (getStake) and priced from the pool's reserves &mdash; the exact position right now. If the live read fails, it falls back to valuing remaining deposits at today's closes, marked (est.). The gap between current value and capital at work is market gain or loss.</div>
 ${calcBlock(r)}
 ${priceNote}
 </td></tr></table>`;
@@ -168,7 +168,7 @@ function fullEmail(r, ctx) {
 
   const poolText = (p) =>
     p.principalKnown
-      ? `${p.name}: ${pct(p.apr)} APR (${pct(p.apy)} APY) — ${money(p.rewards)} rewards; ${money(p.gross)} total cost basis; current value ${money(p.curVal)}`
+      ? `${p.name}: ${pct(p.apr)} APR (${pct(p.apy)} APY) — ${money(p.rewards)} rewards; ${money(p.gross)} total cost basis; current value${p.liveValue ? '' : ' (est.)'} ${money(p.curVal)}`
       : `${p.name}: n/a — capital at work not detected (${money(p.rewards)} rewards)`;
   const calcText = (p) => {
     if (!p.calc || !p.calc.length) return '';
@@ -180,10 +180,10 @@ function fullEmail(r, ctx) {
   const text =
     `Your weekly Ryze LP digest\n${r.firstDay} → ${r.end} (${r.days} days)\nWallet: ${r.wallet}\n\n` +
     `Blended: ${b.principalKnown ? pct(b.apr) + ' APR (' + pct(b.apy) + ' APY)' : 'n/a — capital at work not detected'}\n` +
-    `Total cost basis: ${money(b.gross)}    Current value: ${money(b.curVal)}\n` +
+    `Total cost basis: ${money(b.gross)}    Current value${b.liveValue ? '' : ' (est.)'}: ${money(b.curVal)}\n` +
     `Total rewards: ${money(b.rewards)} (claimed ${money(r.pools.W.claimed + r.pools.B.claimed)} + unclaimed ${money(r.pools.W.unclaimed + r.pools.B.unclaimed)})\n\n` +
     poolText(r.pools.W) + calcText(r.pools.W) + '\n' + poolText(r.pools.B) + calcText(r.pools.B) + '\n\n' +
-    `Method: total cost basis is the actual amount committed, before the protocol converts it into the pool position. Capital at work time-weights that over the window, and the APR is figured on capital at work. Market moves never change either number, so the APR is pure yield, not price appreciation.` +
+    `Method: total cost basis is the actual amount committed, before the protocol converts it into the pool position. Capital at work time-weights that over the window, and the APR is figured on capital at work. Current value is read live from each pool's staking gauge; if that read fails it falls back to a priced-lots estimate, marked (est.). Market moves never change either number, so the APR is pure yield, not price appreciation.` +
     (ctx.unsubUrl ? `\n\nUnsubscribe: ${ctx.unsubUrl}` : '');
   return { subject, text, html };
 }
