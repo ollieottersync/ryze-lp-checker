@@ -579,7 +579,7 @@ const RyzeEngine = (() => {
 
   // Find deposit txs: the wallet sends USDC/WETH/cbBTC in a tx that deposits an
   // LP token into a Ryze gauge pool. Any recipient counts, so deposits made
-  // through any router or direct staking are detected.
+  // through any router or direct deposits are detected.
   async function extractDeposits(transfers, wallet, { onProgress }) {
     const w = wallet.toLowerCase();
     const byTx = new Map();
