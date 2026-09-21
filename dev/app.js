@@ -71,8 +71,11 @@
       `which is why it can read lower than total cost basis. (Converting the deposit ` +
       `into the pool position also costs a small amount in swap fees &mdash; typically ` +
       `a few dollars per deposit.) Market moves never change either number, so the APR ` +
-      `is pure yield, not price appreciation. Current value is what's still in the pool ` +
-      `at today's prices &mdash; the gap between the two is market gain or loss.</p>
+      `is pure yield, not price appreciation. Current value is read live from each ` +
+      `pool's staking gauge (getStake) and priced from the pool's reserves &mdash; ` +
+      `it's the exact position right now. If the live read fails, it falls back to ` +
+      `valuing your remaining deposits at today's closes, marked (est.). The gap ` +
+      `between current value and capital at work is market gain or loss.</p>
         </div>
       </details>`;
   }
@@ -120,7 +123,7 @@
           <tr><td>APY (weekly-comp)</td><td>${p.principalKnown ? pct(p.apy) : '<span class="na">n/a</span>'}</td></tr>
           <tr><td>Total rewards</td><td>${money(p.rewards)}</td></tr>
           <tr><td>Total cost basis</td><td>${money(p.gross)}</td></tr>
-          <tr><td>Current value</td><td>${money(p.curVal)}</td></tr>
+          <tr><td>Current value${p.liveValue ? '' : ' (est.)'}</td><td>${money(p.curVal)}</td></tr>
           <tr><td>Claimed (${p.nClaims})</td><td>${money(p.claimed)}</td></tr>
           <tr><td>Unclaimed</td><td>${money(p.unclaimed)}</td></tr>
         </table>
@@ -170,7 +173,7 @@
           <div class="stat"><div class="k">APY</div><div class="v">${b.principalKnown ? pct(b.apy) : 'n/a'}</div></div>
           <div class="stat"><div class="k">Rewards</div><div class="v">${money(b.rewards)}</div></div>
           <div class="stat"><div class="k">Total cost basis</div><div class="v">${money(b.gross)}</div></div>
-          <div class="stat"><div class="k">Current value</div><div class="v">${money(b.curVal)}</div></div>
+          <div class="stat"><div class="k">Current value${b.liveValue ? '' : ' (est.)'}</div><div class="v">${money(b.curVal)}</div></div>
         </div>
       </div>
       <div class="pools">
