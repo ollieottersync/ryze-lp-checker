@@ -223,6 +223,73 @@ const RyzeEngine = (() => {
     }
   }
 
+  // ------------------------------------------------------- persistent cache --
+  // Blockscout throttles aggressively per IP, and mobile-carrier IPs are
+  // shared by thousands of users, so a phone on cellular data can get
+  // hard-throttled mid-analysis. Two mitigations, both in localStorage:
+  //   1. Per-tx token transfers are IMMUTABLE — cache them forever. A retry
+  //      after a rate-limit resumes where the previous attempt died instead
+  //      of re-fetching hundreds of transactions from scratch.
+  //   2. The wallet's transfer list changes with new activity — cache it for
+  //      10 minutes so an immediate retry skips Blockscout entirely.
+  // Caching is best-effort: private mode / quota errors just mean no cache.
+  const _store = (() => {
+    try {
+      if (typeof localStorage === 'undefined') return null;
+      localStorage.setItem('__ryze_probe', '1');
+      localStorage.removeItem('__ryze_probe');
+      return localStorage;
+    } catch {
+      return null;
+    }
+  })();
+  const TX_CACHE_PREFIX = 'ryze.v1.tx.';
+  const ADDR_CACHE_PREFIX = 'ryze.v1.addr.';
+  const ADDR_CACHE_TTL_MS = 10 * 60 * 1000;
+
+  function cacheGet(key) {
+    if (!_store) return null;
+    try {
+      const raw = _store.getItem(key);
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  }
+  function cacheSet(key, val) {
+    if (!_store) return;
+    try {
+      _store.setItem(key, JSON.stringify(val));
+    } catch {
+      /* quota or private mode — caching is best-effort */
+    }
+  }
+  // Compact transfer tuple: [txHash, logIndex, symbol, value, decimals, from, to, timestamp]
+  // Only the fields the extractors read (sym/amt/addrOf/dayOf/txHash/logIndex).
+  function packTransfer(x) {
+    return [
+      x.transaction_hash || '',
+      x.log_index == null ? '' : String(x.log_index),
+      sym(x),
+      (x.total && x.total.value != null ? String(x.total.value) : '0'),
+      (x.token && x.token.decimals != null ? String(x.token.decimals) : '18'),
+      addrOf(x.from),
+      addrOf(x.to),
+      x.timestamp || '',
+    ];
+  }
+  function unpackTransfer(t) {
+    return {
+      transaction_hash: t[0],
+      log_index: t[1],
+      token: { symbol: t[2], decimals: t[4] },
+      total: { value: t[3] },
+      from: { hash: t[5] },
+      to: { hash: t[6] },
+      timestamp: t[7],
+    };
+  }
+
   // Blockscout's public API rate-limits burst traffic (HTTP 429). Serialize
   // Blockscout requests behind a small pacing gate (~1 request per 300ms)
   // so the page stays comfortably under the limit instead of tripping it.
@@ -328,12 +395,20 @@ const RyzeEngine = (() => {
   async function txTransfers(txHash) {
     const h = txHash.toLowerCase();
     if (!_txCache.has(h)) {
-      const d = await fetchJSON(
-        `${BLOCKSCOUT}/transactions/${txHash}/token-transfers`,
-        { tries: 4 }
-      );
-      _txCache.set(h, d.items || []);
-      await sleep(120);
+      // Immutable per-tx data: serve from the persistent cache when present.
+      const hit = cacheGet(TX_CACHE_PREFIX + h);
+      if (hit && Array.isArray(hit)) {
+        _txCache.set(h, hit.map(unpackTransfer));
+      } else {
+        const d = await fetchJSON(
+          `${BLOCKSCOUT}/transactions/${txHash}/token-transfers`,
+          { tries: 4 }
+        );
+        const items = d.items || [];
+        _txCache.set(h, items);
+        cacheSet(TX_CACHE_PREFIX + h, items.map(packTransfer));
+        await sleep(120);
+      }
     }
     return _txCache.get(h);
   }
@@ -355,11 +430,25 @@ const RyzeEngine = (() => {
   }
 
   // ------------------------------------------------------------- fetch ----
+  // Returns { items, cached }. The wallet transfer list is cached for 10
+  // minutes so a retry right after a rate-limit makes zero Blockscout calls
+  // for this step.
   function fetchWalletTransfers(wallet, onProgress) {
+    const ck = ADDR_CACHE_PREFIX + wallet.toLowerCase();
+    const hit = cacheGet(ck);
+    if (
+      hit && hit.ts && Date.now() - hit.ts < ADDR_CACHE_TTL_MS &&
+      Array.isArray(hit.items)
+    ) {
+      return Promise.resolve({ items: hit.items.map(unpackTransfer), cached: true });
+    }
     return getPaginated(
       `${BLOCKSCOUT}/addresses/${wallet}/token-transfers`,
       onProgress
-    );
+    ).then((items) => {
+      cacheSet(ck, { ts: Date.now(), items: items.map(packTransfer) });
+      return { items, cached: false };
+    });
   }
 
   // Kraken daily closes, primary price source (matches reference engine).
@@ -645,10 +734,13 @@ const RyzeEngine = (() => {
     const end = today || pacificToday();
 
     prog('transfers', 0, 0, 'Fetching transfer history from Blockscout…');
-    const transfers = await fetchWalletTransfers(wallet, (page, count) =>
+    const { items: transfers, cached: transfersCached } = await fetchWalletTransfers(wallet, (page, count) =>
       prog('transfers', page, 0, `Fetching transfer history… (${count} transfers so far)`)
     );
-    prog('transfers', 1, 1, `${transfers.length} transfers found. Detecting claims…`);
+    prog('transfers', 1, 1,
+      transfersCached
+        ? `${transfers.length} transfers loaded from cache. Detecting claims…`
+        : `${transfers.length} transfers found. Detecting claims…`);
     const claims = extractClaims(transfers, wallet);
 
     prog('deposits', 0, 1, 'Detecting deposits…');
@@ -934,8 +1026,8 @@ const RyzeEngine = (() => {
         showError('Invalid address format.');
       } else if (err && /HTTP 429/.test(err.message || '')) {
         showError(
-          'Blockscout is rate-limiting requests right now. Wait a minute and try again — ' +
-          'the page backs off and retries automatically, but the limit can persist under heavy use.'
+          'Blockscout is rate-limiting requests right now. Your progress is saved — ' +
+          'wait a minute and tap "Check performance" again to pick up where it left off.'
         );
       } else {
         showError(
