@@ -127,7 +127,7 @@
         <ul>
           <li>Total cost basis = the actual amount the wallet committed, valued on deposit day &mdash; what went in <i>before</i> the protocol converted it into the pool position. The purest comparable figure: Ryze pools aren't 50/50, so the converted split differs with every deposit. Capital at work time-weights that over the window (a deposit made later counts for fewer days), which is why it can read lower than total cost basis. The APR is always figured on capital at work.</li>
           <li>Capital at work = FIFO cost basis of what's in the pool, averaged over the window: each deposit is valued at that day's close (Kraken daily closes, USDC = $1); withdrawals consume the oldest lots first at their original cost. Market moves after a deposit never change it.</li>
-          <li>Current value = what's still in the pool at today's closes. The gap between current value and capital at work is market gain or loss.</li>
+          <li>Current value = your live staked position, read on-chain from each pool's staking gauge via <code>getStake(address)</code> and priced as pool reserves &divide; LP supply &mdash; the exact position right now, not an estimate. If the on-chain read fails, it falls back to valuing your remaining deposit lots at today's closes, marked (est.). The gap between current value and capital at work is market gain or loss.</li>
           <li>Deposits: transactions where the wallet sends USDC/WETH/cbBTC and the same transaction deposits LP into a Ryze pool. Plain swaps excluded; dust returned to the wallet is netted off.</li>
           <li>Withdrawals: transactions that burn pool LP with underlying returned to the wallet.</li>
           <li>Rewards = claimed (pool &rarr; wallet USDC transfers) + unclaimed (read live from each pool's claimable-rewards view).</li>
@@ -245,6 +245,11 @@
  *   5. TWAP, realized APR = rewards/TWAP * 365/days,
  *      APY = (1+APR/52)^52 - 1.
  *   6. Unclaimed rewards read live from each pool's claimable-rewards view.
+ *   7. Current value is read LIVE from each staking gauge via
+ *      getStake(address) — the wallet's true on-chain LP-token balance,
+ *      priced as pool TVL / LP supply. If the read fails, the engine falls
+ *      back to valuing the remaining FIFO lots at current closes and flags
+ *      the figure as an estimate (liveValue: false).
  *
  * Deposits and withdrawals are auto-detected from on-chain transfers for
  * every wallet — no wallet-specific history is hardcoded anywhere.
@@ -264,6 +269,18 @@ const RyzeEngine = (() => {
   const ZERO = '0x0000000000000000000000000000000000000000';
 
   const CLAIMABLE_SEL = '7a27db57'; // claimableRewards(address user, address token)
+  const GETSTAKE_SEL = '7a766460'; // getStake(address) -> (uint256 stakedLP, uint256 since)
+  const RYZE_TVL_API = 'https://mainnet.api.ryze.pro/api/analytics/tvl';
+  // LP-token contracts (the pools themselves) — used to price LP tokens when
+  // the analytics API is down: totalSupply() on the pool, balanceOf(pool) on
+  // each underlying token. Same shape as the API path, computed on-chain.
+  const RYZE_POOLS = {
+    W: '0x22f902cEfcF8b0bEc6489Cb8ac11FdDa9B2aF125', // Ryze WETH-USDC Pool
+    B: '0x40F3DAaE59BfE03f9Fb019Bb089Bb0C381DE27Cf', // Ryze cbBTC-USDC Pool
+  };
+  const WETH = '0x4200000000000000000000000000000000000006';
+  const CBBTC = '0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf';
+  const UNDERLYING_DECIMALS = { USDC: 6, WETH: 18, CBBTC: 8 };
 
   const BLOCKSCOUT = 'https://base.blockscout.com/api/v2';
   const KRAKEN = 'https://api.kraken.com/0/public/OHLC';
@@ -607,33 +624,147 @@ const RyzeEngine = (() => {
     }
   }
 
-  async function readUnclaimed(pool, wallet) {
-    const data =
-      '0x' +
-      CLAIMABLE_SEL +
-      wallet.slice(2).toLowerCase().padStart(64, '0') +
-      USDC.slice(2).toLowerCase().padStart(64, '0');
+  // eth_call with RPC fallback. Shared by every on-chain view read
+  // (unclaimed rewards, gauge stakes, LP pricing). Throws 'rpc-unavailable'
+  // when every RPC fails.
+  async function rpcEthCall(to, data) {
     const body = {
       jsonrpc: '2.0',
       id: 1,
       method: 'eth_call',
-      params: [{ to: pool, data }, 'latest'],
+      params: [{ to, data }, 'latest'],
     };
     let lastErr = null;
     for (const rpc of RPCS) {
       try {
         const r = await fetchJSON(rpc, { postData: body, tries: 2, timeout: 20000 });
         if (r && typeof r.result === 'string' && r.result.startsWith('0x')) {
-          return Number(BigInt(r.result)) / 1e6;
+          return r.result;
         }
         throw new Error('bad rpc result');
       } catch (e) {
         lastErr = e;
       }
     }
-    const err = new Error('unclaimed-unavailable');
+    const err = new Error('rpc-unavailable');
     err.cause = lastErr;
     throw err;
+  }
+
+  async function readUnclaimed(pool, wallet) {
+    const data =
+      '0x' +
+      CLAIMABLE_SEL +
+      wallet.slice(2).toLowerCase().padStart(64, '0') +
+      USDC.slice(2).toLowerCase().padStart(64, '0');
+    try {
+      return Number(BigInt(await rpcEthCall(pool, data))) / 1e6;
+    } catch (e) {
+      const err = new Error('unclaimed-unavailable');
+      err.cause = e;
+      throw err;
+    }
+  }
+
+  // ------------------------------------------------- live position read ---
+  // Current value, exact: getStake(address) on each staking gauge returns a
+  // 2-word struct (uint256 stakedLP, uint256 since) — the wallet's true
+  // on-chain LP-token balance. Priced per LP token as pool TVL / LP supply.
+  // The analytics API supplies both TVL inputs; if it's down, the same
+  // numbers are read on-chain instead (totalSupply on the pool contract,
+  // balanceOf on each underlying token). Any failure here is non-fatal:
+  // analyze() keeps the FIFO-lot estimate and marks the figure (est.).
+  function decodeStakeLp(result) {
+    // First 32-byte word of the getStake return. Tolerates short or empty
+    // hex — some RPCs trim leading zero words.
+    if (!result || typeof result !== 'string') return 0n;
+    const hex = result.startsWith('0x') ? result.slice(2) : result;
+    if (!hex) return 0n;
+    return BigInt('0x' + hex.slice(0, 64));
+  }
+
+  // Nearest-earlier value in a {day: close} map (insurance against a gap).
+  function pxAt(map, date) {
+    if (map[date] != null) return map[date];
+    let v = 0;
+    for (const k of Object.keys(map).sort()) {
+      if (k <= date) v = map[k];
+      else break;
+    }
+    return v;
+  }
+
+  async function lpUsdPerLpFromApi(ethPx, btcPx) {
+    const d = await fetchJSON(RYZE_TVL_API, { tries: 2, timeout: 20000 });
+    const out = { W: 0, B: 0 };
+    for (const p of (d && d.pools) || []) {
+      const addrs = (p.assets || []).map((a) => (a.tokenAddress || '').toLowerCase());
+      const key = addrs.includes(WETH) ? 'W' : addrs.includes(CBBTC) ? 'B' : null;
+      if (!key) continue;
+      let tvl = 0;
+      for (const a of p.assets || []) {
+        const ta = (a.tokenAddress || '').toLowerCase();
+        const amt = Number(BigInt(a.balance)) / 10 ** a.decimals;
+        if (ta === USDC.toLowerCase()) tvl += amt;
+        else if (ta === WETH) tvl += amt * ethPx;
+        else if (ta === CBBTC) tvl += amt * btcPx;
+      }
+      const supply = Number(BigInt(p.totalSupplyLP)) / 1e18;
+      if (supply > 0 && tvl > 0) out[key] = tvl / supply;
+    }
+    if (!out.W || !out.B) throw new Error('lp-price-unavailable');
+    return out;
+  }
+
+  async function lpUsdPerLpOnChain(ethPx, btcPx) {
+    const SEL_BAL = '70a08231'; // balanceOf(address)
+    const SEL_TSUP = '18160ddd'; // totalSupply()
+    const pad = (a) => a.slice(2).toLowerCase().padStart(64, '0');
+    const out = {};
+    for (const q of ['W', 'B']) {
+      const pool = RYZE_POOLS[q];
+      const [tsRes, usdcRes, wethRes, cbbtcRes] = await Promise.all([
+        rpcEthCall(pool, '0x' + SEL_TSUP),
+        rpcEthCall(USDC, '0x' + SEL_BAL + pad(pool)),
+        rpcEthCall(WETH, '0x' + SEL_BAL + pad(pool)),
+        rpcEthCall(CBBTC, '0x' + SEL_BAL + pad(pool)),
+      ]);
+      const supply = Number(decodeStakeLp(tsRes)) / 1e18;
+      const tvl =
+        Number(decodeStakeLp(usdcRes)) / 10 ** UNDERLYING_DECIMALS.USDC +
+        (Number(decodeStakeLp(wethRes)) / 10 ** UNDERLYING_DECIMALS.WETH) * ethPx +
+        (Number(decodeStakeLp(cbbtcRes)) / 10 ** UNDERLYING_DECIMALS.CBBTC) * btcPx;
+      if (!(supply > 0 && tvl > 0)) throw new Error('lp-price-unavailable');
+      out[q] = tvl / supply;
+    }
+    return out;
+  }
+
+  // Returns { W: {usd, ok}, B: {usd, ok} }. Never throws — a failure on any
+  // pool just marks that pool not-ok and the caller keeps the FIFO estimate.
+  async function readLivePositions(wallet, prices, end) {
+    const out = { W: { usd: 0, ok: false }, B: { usd: 0, ok: false } };
+    try {
+      const ethPx = pxAt(prices.ETH.map, end);
+      const btcPx = pxAt(prices.BTC.map, end);
+      if (!(ethPx > 0 && btcPx > 0)) return out;
+      let perLp;
+      try {
+        perLp = await lpUsdPerLpFromApi(ethPx, btcPx);
+      } catch {
+        perLp = await lpUsdPerLpOnChain(ethPx, btcPx);
+      }
+      const addrWord = wallet.slice(2).toLowerCase().padStart(64, '0');
+      for (const q of ['W', 'B']) {
+        const gauge = q === 'W' ? WETH_VAULT : CBBTC_VAULT;
+        const res = await rpcEthCall(gauge, '0x' + GETSTAKE_SEL + addrWord);
+        const lp = decodeStakeLp(res);
+        out[q] = { usd: (Number(lp) / 1e18) * perLp[q], ok: true };
+      }
+    } catch {
+      /* non-fatal: caller falls back to the FIFO estimate */
+    }
+    return out;
   }
 
   // ------------------------------------------------------------- analysis -
@@ -1115,7 +1246,7 @@ const RyzeEngine = (() => {
     const prices = { ETH, BTC };
     const priceSource = ETH.src === BTC.src ? ETH.src : `${ETH.src} / ${BTC.src}`;
 
-    prog('compute', 0, 1, 'Computing cost basis…');
+    prog('compute', 0, 2, 'Computing cost basis…');
     const flows = [
       ...netDeposits.map((d) => ({ date: d.date, pool: d.pool, net: d.net })),
       ...withdrawals.map((d) => ({
@@ -1136,6 +1267,11 @@ const RyzeEngine = (() => {
       end
     );
 
+    // Live position read: the gauge's getStake is the exact current value.
+    // On any failure each pool keeps the FIFO-lot estimate, flagged (est.).
+    prog('compute', 1, 2, 'Reading live pool positions…');
+    const live = await readLivePositions(wallet, prices, end);
+
     const wdByPool = { W: 0, B: 0 };
     for (const wd of withdrawals) {
       if (wdByPool[wd.pool] != null) wdByPool[wd.pool]++;
@@ -1148,6 +1284,8 @@ const RyzeEngine = (() => {
       const rewards = claimed + (unclaimedOk ? unclaimed[q] : 0);
       const t = twap[q];
       const apr = t > 0 ? (rewards / t) * (365 / days) : 0;
+      const estCurVal = curVal[q];
+      const lv = (live && live[q]) || { usd: 0, ok: false };
       pools[q] = {
         name: POOL_NAMES[q],
         rewards,
@@ -1155,7 +1293,9 @@ const RyzeEngine = (() => {
         gross: gross[q],
         calc: depositDetail.filter((d) => d.pool === q),
         calcExact: wdByPool[q] === 0,
-        curVal: curVal[q],
+        curVal: lv.ok ? r4(lv.usd) : estCurVal,
+        liveValue: lv.ok,
+        estCurVal,
         apr,
         apy: (1 + apr / 52) ** 52 - 1,
         claimed,
@@ -1172,11 +1312,12 @@ const RyzeEngine = (() => {
       twap: bTwap,
       gross: gross.W + gross.B,
       curVal: pools.W.curVal + pools.B.curVal,
+      liveValue: pools.W.liveValue && pools.B.liveValue,
       apr: bApr,
       apy: (1 + bApr / 52) ** 52 - 1,
       principalKnown: bTwap > 0,
     };
-    prog('compute', 1, 1, 'Done.');
+    prog('compute', 2, 2, 'Done.');
 
     return {
       wallet, end, firstDay, days,
@@ -1192,7 +1333,7 @@ const RyzeEngine = (() => {
     };
   }
 
-  return { analyze, POOL_NAMES, setRetryHook };
+  return { analyze, POOL_NAMES, setRetryHook, decodeStakeLp };
 })();
 
 
@@ -1271,8 +1412,11 @@ const RyzeEngine = (() => {
       `which is why it can read lower than total cost basis. (Converting the deposit ` +
       `into the pool position also costs a small amount in swap fees &mdash; typically ` +
       `a few dollars per deposit.) Market moves never change either number, so the APR ` +
-      `is pure yield, not price appreciation. Current value is what's still in the pool ` +
-      `at today's prices &mdash; the gap between the two is market gain or loss.</p>
+      `is pure yield, not price appreciation. Current value is read live from each ` +
+      `pool's staking gauge (getStake) and priced from the pool's reserves &mdash; ` +
+      `it's the exact position right now. If the live read fails, it falls back to ` +
+      `valuing your remaining deposits at today's closes, marked (est.). The gap ` +
+      `between current value and capital at work is market gain or loss.</p>
         </div>
       </details>`;
   }
@@ -1320,7 +1464,7 @@ const RyzeEngine = (() => {
           <tr><td>APY (weekly-comp)</td><td>${p.principalKnown ? pct(p.apy) : '<span class="na">n/a</span>'}</td></tr>
           <tr><td>Total rewards</td><td>${money(p.rewards)}</td></tr>
           <tr><td>Total cost basis</td><td>${money(p.gross)}</td></tr>
-          <tr><td>Current value</td><td>${money(p.curVal)}</td></tr>
+          <tr><td>Current value${p.liveValue ? '' : ' (est.)'}</td><td>${money(p.curVal)}</td></tr>
           <tr><td>Claimed (${p.nClaims})</td><td>${money(p.claimed)}</td></tr>
           <tr><td>Unclaimed</td><td>${money(p.unclaimed)}</td></tr>
         </table>
@@ -1370,7 +1514,7 @@ const RyzeEngine = (() => {
           <div class="stat"><div class="k">APY</div><div class="v">${b.principalKnown ? pct(b.apy) : 'n/a'}</div></div>
           <div class="stat"><div class="k">Rewards</div><div class="v">${money(b.rewards)}</div></div>
           <div class="stat"><div class="k">Total cost basis</div><div class="v">${money(b.gross)}</div></div>
-          <div class="stat"><div class="k">Current value</div><div class="v">${money(b.curVal)}</div></div>
+          <div class="stat"><div class="k">Current value${b.liveValue ? '' : ' (est.)'}</div><div class="v">${money(b.curVal)}</div></div>
         </div>
       </div>
       <div class="pools">
