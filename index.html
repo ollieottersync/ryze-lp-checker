@@ -67,6 +67,11 @@
   footer h4{font-size:0.85rem;margin:18px 0 6px;color:var(--ink)}
   footer ul{margin:6px 0;padding-left:20px}
   footer li{margin-bottom:4px}
+  .deet{margin-top:10px;border:1px solid var(--line);border-radius:10px;background:#fbfcfe}
+  .deet summary{cursor:pointer;padding:10px 14px;font-weight:600;font-size:0.85rem;color:var(--ink)}
+  .deet ol{margin:6px 0;padding:0 20px 0 36px;font-size:0.82rem}
+  .deet li{margin-bottom:6px}
+  .deet .fine{font-size:0.78rem;padding:0 14px 12px;color:var(--muted)}
   .footgrid{display:flex;gap:24px;flex-wrap:wrap}
   .footgrid>div{flex:1 1 220px}
   .na{color:var(--muted);font-weight:400}
@@ -110,6 +115,17 @@
           <li>Rewards = claimed (vault &rarr; wallet USDC transfers) + unclaimed (read live from each vault's claimable-rewards view).</li>
           <li>Realized APR = rewards &divide; TWAP &times; 365/days. APY = (1+APR/52)<sup>52</sup>&minus;1 (weekly compounding).</li>
         </ul>
+        <details class="deet">
+          <summary>How time-weighted principal is computed, step by step</summary>
+          <ol>
+            <li><b>Find the flows.</b> Every deposit and withdrawal becomes a dated entry: date, pool, and token amounts (USDC / WETH / cbBTC). Claims never touch principal.</li>
+            <li><b>Vault migrations net out.</b> When a withdrawal is followed within 2 days by deposits into the same pool (e.g. a vault migration: unstake the old vault, re-stake the new one), the pair is netted to its capital delta &mdash; only genuinely new money counts as a deposit.</li>
+            <li><b>Walk every day.</b> Starting from the first activity day through today, each day's flows are applied to running per-pool balances, which are then marked to market: USDC counts at $1, WETH at that day's ETH close, cbBTC at that day's BTC close (Kraken daily closes, Coinbase Exchange fallback). Balances can't go below zero.</li>
+            <li><b>Average it.</b> Time-weighted principal (TWAP) is the average of those daily USD balances, per pool. The blended figure is the sum of both pools.</li>
+            <li><b>Divide rewards by TWAP.</b> Realized APR = total rewards &divide; TWAP &times; 365 &divide; days in the window.</li>
+          </ol>
+          <p class="fine">Limits, stated plainly: principal is reconstructed from funds <b>the wallet itself</b> sends &mdash; stakes funded directly by a third party can't be attributed from transfer history alone. The figure is <b>rewards-only</b>: it measures reward payouts against principal, not total position P&amp;L (no impermanent loss, no in-pool fee accrual).</p>
+        </details>
       </div>
       <div>
         <h4>Notes</h4>
@@ -140,10 +156,16 @@
  *      stakes an LP token into a Ryze gauge vault. Helper dust returned to
  *      the wallet in the same tx is netted off. Plain swaps (no vault
  *      stake in the tx) are excluded.
- *   3. Withdrawals = txs where vault LP is burned (vault -> 0x0) and
- *      underlying (USDC/WETH/cbBTC) is returned to the wallet.
+ *   3. Withdrawals = txs where a vault LP token is burned (to 0x0) and
+ *      underlying (USDC/WETH/cbBTC) is returned to the wallet in the same
+ *      tx. The burn separates withdrawals from plain reward payouts.
+ *   3b. Migrations = a withdrawal matched against same-pool deposits in
+ *      the following 2 days (e.g. a vault migration: unstake old vault,
+ *      re-stake new one). The pair nets to its capital delta so the
+ *      re-stake is not counted as brand-new principal.
  *   4. Principal series per pool = cumulative (genesis + deposits -
- *      withdrawals), marked daily with closes (USDC=$1).
+ *      withdrawals), floored at zero per token per day, marked daily with
+ *      closes (USDC=$1).
  *   5. TWAP, realized APR = rewards/TWAP * 365/days,
  *      APY = (1+APR/52)^52 - 1.
  *   6. Unclaimed rewards read live from each vault's claimable-rewards view.
@@ -618,23 +640,36 @@ const RyzeEngine = (() => {
     return deposits;
   }
 
-  // Find withdrawal txs: vault LP burned (vault -> 0x0) with underlying
-  // returned to the wallet in the same tx.
+  // Find withdrawal txs: a vault LP token is burned (sent to 0x0) and
+  // underlying (USDC/WETH/cbBTC) is returned to the wallet in the same tx.
+  // The LP burn is what separates a withdrawal from a plain reward payout
+  // (which has no burn), so the underlying may come back via the helper,
+  // the vault, or a migration contract — the sender is not allowlisted.
+  // The burner is not required to be a vault either: migration withdrawals
+  // (e.g. the April 2026 vault migration) first release the LP token to the
+  // wallet, which then burns it itself.
   async function extractWithdrawals(transfers, wallet, { onProgress }) {
     const w = wallet.toLowerCase();
-    const helperL = HELPER.toLowerCase();
-    const oldHelperL = OLD_HELPER.toLowerCase();
     const byTx = new Map();
     for (const x of transfers) {
       const fr = addrOf(x.from);
       const to = addrOf(x.to);
-      if (to !== w) continue;
+      if (to !== w || fr === w) continue;
       const s = sym(x);
       if (!TOKENS.includes(s) || amt(x) < 0.01) continue;
-      const viaHelper = fr === helperL;
-      const viaOldHelper = fr === oldHelperL;
-      const viaVault = VAULT_SET.has(fr);
-      if (!(viaHelper || viaOldHelper || viaVault)) continue;
+      const h = x.transaction_hash;
+      if (!byTx.has(h)) byTx.set(h, []);
+      byTx.get(h).push(x);
+    }
+    // A withdrawal also burns LP from the wallet itself (migration-style),
+    // which leaves no underlying receipt from a known sender — catch those
+    // txs too via the wallet's own burn transfers.
+    for (const x of transfers) {
+      const fr = addrOf(x.from);
+      const to = addrOf(x.to);
+      if (fr !== w || to !== ZERO) continue;
+      const s = sym(x);
+      if (TOKENS.includes(s) || !s) continue;
       const h = x.transaction_hash;
       if (!byTx.has(h)) byTx.set(h, []);
       byTx.get(h).push(x);
@@ -651,41 +686,121 @@ const RyzeEngine = (() => {
       async (h) => {
         const items = await txTransfers(h);
         let burnPool = null;
+        let sawBurn = false;
         for (const y of items) {
           const fr = addrOf(y.from);
-          if ((VAULT_SET.has(fr) || poolOf(fr)) && addrOf(y.to) === ZERO) {
-            burnPool = poolOf(fr);
-            break;
+          if (addrOf(y.to) === ZERO && !TOKENS.includes(sym(y))) {
+            sawBurn = true;
+            if (!burnPool) burnPool = poolOf(fr);
           }
         }
-        if (!burnPool) return; // payout without a vault unstake: not a withdrawal
+        if (!sawBurn) return; // payout without an LP burn: not a withdrawal
         const out = { USDC: 0, WETH: 0, CBBTC: 0 };
         for (const y of items) {
           const s = sym(y);
           const a = amt(y);
           if (addrOf(y.to) !== w || !TOKENS.includes(s)) continue;
           const fr = addrOf(y.from);
-          if (fr === helperL || fr === oldHelperL) out[s] += a;
-          else if (VAULT_SET.has(fr) && (s === 'WETH' || s === 'CBBTC')) {
-            out[s] += a; // principal returned directly, not via helper
-          }
+          if (fr === w) continue;
+          if (VAULT_SET.has(fr) && s === 'USDC') continue;
           // vault -> wallet USDC in an unstake tx is the reward claim
           // (counted by extractClaims), not principal — excluded here.
+          out[s] += a;
         }
-        if (Object.values(out).some((v) => v > 0)) {
-          const ts = byTx.get(h).map((t) => dayOf(t)).sort()[0];
-          const net = {};
-          for (const k of TOKENS) {
-            const v = Math.round(out[k] * 1e4) / 1e4;
-            if (v > 0) net[k] = v;
-          }
-          withdrawals.push({ date: ts, pool: burnPool, net, tx: h });
+        if (!Object.values(out).some((v) => v > 0)) return;
+        // Pool: prefer the burner's vault; otherwise infer from the
+        // underlying returned (cbBTC => cbBTC-USDC pool, WETH => WETH-USDC).
+        let pool = burnPool;
+        if (!pool) pool = out.CBBTC > 0 ? 'B' : out.WETH > 0 ? 'W' : null;
+        if (!pool) return;
+        const ts = byTx.get(h).map((t) => dayOf(t)).sort()[0];
+        const net = {};
+        for (const k of TOKENS) {
+          const v = Math.round(out[k] * 1e4) / 1e4;
+          if (v > 0) net[k] = v;
         }
+        withdrawals.push({ date: ts, pool, net, tx: h });
       },
       onProgress
     );
     withdrawals.sort((p, q) => (p.date < q.date ? -1 : 1));
     return withdrawals;
+  }
+
+  // Vault-migration handling (generic — no wallet-specific history).
+  // When a vault is migrated, the wallet unstakes from the old vault and
+  // re-stakes into the new one days apart. Naively that reads as a full
+  // withdrawal followed by brand-new deposits, roughly doubling the
+  // time-weighted principal and halving the APR. Instead, match each
+  // withdrawal against same-pool deposits in the following
+  // MIGRATION_WINDOW_DAYS days and net them: the deposit keeps only the
+  // net-new capital (it may go slightly negative = a net outflow), and a
+  // fully-absorbed withdrawal is dropped. Coincidental withdraw+deposit
+  // pairs are harmless here — netting only re-times the net flow by at
+  // most the window length, which barely moves a time-weighted average.
+  const MIGRATION_WINDOW_DAYS = 2;
+  const r4 = (n) => Math.round(n * 1e4) / 1e4;
+  function dayDiff(a, b) {
+    const msA = Date.UTC(+a.slice(0, 4), +a.slice(5, 7) - 1, +a.slice(8, 10));
+    const msB = Date.UTC(+b.slice(0, 4), +b.slice(5, 7) - 1, +b.slice(8, 10));
+    return (msB - msA) / 86400000;
+  }
+  function netMigrations(deposits, withdrawals) {
+    const dps = deposits.map((d) => ({
+      date: d.date,
+      pool: d.pool,
+      tx: d.tx,
+      net: { USDC: d.net.USDC || 0, WETH: d.net.WETH || 0, CBBTC: d.net.CBBTC || 0 },
+      migration: false,
+    }));
+    const wds = withdrawals.map((w) => ({
+      date: w.date,
+      pool: w.pool,
+      tx: w.tx,
+      remaining: { USDC: w.net.USDC || 0, WETH: w.net.WETH || 0, CBBTC: w.net.CBBTC || 0 },
+      absorbed: false,
+    }));
+    dps.sort((p, q) => (p.date < q.date ? -1 : p.date > q.date ? 1 : 0));
+    wds.sort((p, q) => (p.date < q.date ? -1 : p.date > q.date ? 1 : 0));
+    let migrations = 0;
+    for (const wd of wds) {
+      for (const d of dps) {
+        if (d.pool !== wd.pool) continue;
+        const diff = dayDiff(wd.date, d.date);
+        if (diff < 0 || diff > MIGRATION_WINDOW_DAYS) continue;
+        let touched = false;
+        for (const t of TOKENS) {
+          const take = Math.min(d.net[t], wd.remaining[t]);
+          if (take > 0) {
+            d.net[t] = r4(d.net[t] - take);
+            wd.remaining[t] = r4(wd.remaining[t] - take);
+            touched = true;
+          }
+        }
+        if (touched) {
+          d.migration = true;
+          if (!wd.absorbed) {
+            wd.absorbed = true;
+            migrations++;
+          }
+        }
+      }
+    }
+    const keptDeposits = dps.map((d) => {
+      const net = {};
+      for (const t of TOKENS) if (d.net[t] !== 0) net[t] = d.net[t];
+      return { date: d.date, pool: d.pool, tx: d.tx, net, migration: d.migration };
+    });
+    // An absorbed withdrawal keeps any unabsorbed remainder (a partial
+    // re-stake is still a net outflow); only fully-absorbed ones drop out.
+    const keptWithdrawals = wds
+      .filter((wd) => Object.values(wd.remaining).some((v) => v > 0))
+      .map((wd) => {
+        const net = {};
+        for (const t of TOKENS) if (wd.remaining[t] > 0) net[t] = wd.remaining[t];
+        return { date: wd.date, pool: wd.pool, tx: wd.tx, net };
+      });
+    return { deposits: keptDeposits, withdrawals: keptWithdrawals, migrations };
   }
 
   function buildSeries(events, flows, prices, start, end) {
@@ -709,7 +824,12 @@ const RyzeEngine = (() => {
       const s = new Date(dms).toISOString().slice(0, 10);
       for (const [pool, du, de, db] of ev[s] || []) {
         const b = bal[pool];
-        b[0] += du; b[1] += de; b[2] += db;
+        // Principal can never go negative: a withdrawal can only return
+        // principal the model actually tracked (e.g. stakes funded directly
+        // by a third party are invisible in the wallet's own transfers).
+        b[0] = Math.max(0, b[0] + du);
+        b[1] = Math.max(0, b[1] + de);
+        b[2] = Math.max(0, b[2] + db);
       }
       tw.W += bal.W[0] + bal.W[1] * (ETH[s] || 0);
       tw.B += bal.B[0] + bal.B[2] * (BTC[s] || 0);
@@ -749,16 +869,21 @@ const RyzeEngine = (() => {
         prog('deposits', done, total, `Analyzing deposit transactions… (${done}/${total})`),
     });
     prog('withdrawals', 0, 1, 'Detecting withdrawals…');
-    const withdrawals = await extractWithdrawals(transfers, wallet, {
+    const rawWithdrawals = await extractWithdrawals(transfers, wallet, {
       onProgress: (done, total) =>
         prog('withdrawals', done, total, `Analyzing withdrawal transactions… (${done}/${total})`),
     });
+    // Vault migrations (unstake + re-stake) net to their capital delta —
+    // otherwise the re-stake reads as brand-new principal.
+    const mig = netMigrations(deposits, rawWithdrawals);
+    const netDeposits = mig.deposits;
+    const withdrawals = mig.withdrawals;
 
     const genesis = [];
     const cands = [
       ...claims.map((c) => c.date),
       ...genesis.map((e) => e[0]),
-      ...deposits.map((d) => d.date),
+      ...netDeposits.map((d) => d.date),
       ...withdrawals.map((d) => d.date),
     ].filter(Boolean);
     const firstDay = cands.length ? cands.sort()[0] : null;
@@ -806,7 +931,7 @@ const RyzeEngine = (() => {
 
     prog('compute', 0, 1, 'Computing time-weighted principal…');
     const flows = [
-      ...deposits.map((d) => ({ date: d.date, pool: d.pool, net: d.net })),
+      ...netDeposits.map((d) => ({ date: d.date, pool: d.pool, net: d.net })),
       ...withdrawals.map((d) => ({
         date: d.date,
         pool: d.pool,
@@ -854,8 +979,9 @@ const RyzeEngine = (() => {
       wallet, end, firstDay, days,
       pools, blended,
       claims: claims.length,
-      deposits: deposits.length,
+      deposits: netDeposits.length,
       withdrawals: withdrawals.length,
+      migrations: mig.migrations,
       transfers: transfers.length,
       unclaimedOk,
       priceSource,
@@ -995,6 +1121,7 @@ const RyzeEngine = (() => {
           <span>Claims <b>${r.claims}</b></span>
           <span>Deposits <b>${r.deposits}</b></span>
           <span>Withdrawals <b>${r.withdrawals}</b></span>
+          ${r.migrations ? `<span>Vault migrations netted <b>${r.migrations}</b></span>` : ''}
         </div>
         ${priceNote}
       </div>`;
