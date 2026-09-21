@@ -1,0 +1,943 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ryze LP Performance Checker</title>
+<meta name="description" content="Paste any Base wallet address and get a realized-APR report for its Ryze Protocol liquidity positions. Computed entirely in your browser from public data.">
+<style>
+  :root{
+    --bg:#f6f8fb; --card:#ffffff; --ink:#16202e; --muted:#5b6b80;
+    --accent:#0e7c66; --accent-dark:#0a5f4f; --line:#e3e9f0;
+    --good:#0e7c66; --warn:#b7791f; --bad:#b3362b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    line-height:1.5;-webkit-text-size-adjust:100%}
+  .wrap{max-width:760px;margin:0 auto;padding:24px 16px 64px}
+  header{margin:8px 0 20px}
+  h1{font-size:1.65rem;margin:0 0 6px;letter-spacing:-0.01em}
+  .sub{color:var(--muted);margin:0;font-size:0.98rem}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;
+    padding:20px;margin:0 0 16px;box-shadow:0 1px 3px rgba(16,32,46,.06)}
+  label{display:block;font-weight:600;font-size:0.9rem;margin-bottom:8px}
+  .row{display:flex;gap:10px;flex-wrap:wrap}
+  input[type=text]{flex:1 1 280px;padding:12px 14px;font-size:0.95rem;border:1px solid var(--line);
+    border-radius:10px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--ink);
+    background:#fbfcfe;min-width:0}
+  input[type=text]:focus{outline:2px solid var(--accent);border-color:var(--accent)}
+  button{padding:12px 22px;font-size:0.95rem;font-weight:700;color:#fff;background:var(--accent);
+    border:0;border-radius:10px;cursor:pointer;white-space:nowrap}
+  button:hover{background:var(--accent-dark)}
+  button:disabled{opacity:.55;cursor:wait}
+  .hint{font-size:0.82rem;color:var(--muted);margin:10px 0 0}
+  .progress{margin-top:14px;display:none}
+  .progress.on{display:block}
+  .bar{height:8px;background:#e8eef4;border-radius:99px;overflow:hidden}
+  .bar>div{height:100%;width:0;background:var(--accent);border-radius:99px;transition:width .3s}
+  .pmsg{font-size:0.85rem;color:var(--muted);margin-top:8px;min-height:1.4em}
+  .err{display:none;background:#fdecea;border:1px solid #f3c1bb;color:var(--bad);
+    border-radius:10px;padding:12px 14px;margin-top:14px;font-size:0.92rem}
+  .err.on{display:block}
+  #results{display:none}
+  #results.on{display:block}
+  .walletline{font-size:0.85rem;color:var(--muted);margin:0 0 12px;word-break:break-all}
+  .walletline code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:0.82rem}
+  .blend{background:linear-gradient(135deg,#0e7c66,#14957c);color:#fff;border-radius:14px;
+    padding:20px;margin-bottom:16px}
+  .blend .k{font-size:0.78rem;text-transform:uppercase;letter-spacing:.08em;opacity:.85;margin-bottom:4px}
+  .blend .big{font-size:2.1rem;font-weight:800;letter-spacing:-0.02em;line-height:1.1}
+  .blend .row2{display:flex;gap:24px;flex-wrap:wrap;margin-top:12px}
+  .blend .stat .k{margin:0}
+  .blend .stat .v{font-size:1.05rem;font-weight:700}
+  .pools{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
+  @media (max-width:560px){.pools{grid-template-columns:1fr}}
+  .pool{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
+  .pool h3{margin:0 0 10px;font-size:1rem}
+  .pool .apr{font-size:1.5rem;font-weight:800;color:var(--accent);margin:2px 0 10px}
+  .pool table{width:100%;border-collapse:collapse;font-size:0.86rem}
+  .pool td{padding:3px 0;color:var(--muted)}
+  .pool td:last-child{text-align:right;color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums}
+  .meta{display:flex;gap:8px 20px;flex-wrap:wrap;font-size:0.82rem;color:var(--muted);margin:4px 0 0}
+  .meta b{color:var(--ink);font-weight:600}
+  .notice{background:#fff8e8;border:1px solid #ecd9a8;color:#7a5b16;border-radius:10px;
+    padding:12px 14px;font-size:0.9rem;margin-bottom:16px}
+  footer{margin-top:28px;font-size:0.8rem;color:var(--muted)}
+  footer h4{font-size:0.85rem;margin:18px 0 6px;color:var(--ink)}
+  footer ul{margin:6px 0;padding-left:20px}
+  footer li{margin-bottom:4px}
+  .footgrid{display:flex;gap:24px;flex-wrap:wrap}
+  .footgrid>div{flex:1 1 220px}
+  .na{color:var(--muted);font-weight:400}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Ryze LP Performance Checker</h1>
+    <p class="sub">Paste any Base wallet address for an instant realized-APR report on its
+      Ryze Protocol liquidity positions. Computed entirely in your browser from public data &mdash; nothing is uploaded or tracked.</p>
+  </header>
+
+  <div class="card">
+    <form id="form" autocomplete="off">
+      <label for="addr">Base wallet address</label>
+      <div class="row">
+        <input type="text" id="addr" name="addr" spellcheck="false"
+               placeholder="0x…" value="0x3503F40b65A4dDa32a84bfe4Cd806b4daD4E2EA6">
+        <button type="submit" id="go">Check performance</button>
+      </div>
+      <p class="hint">Read-only: this page only queries public blockchain and price APIs. It never asks for a wallet connection or signature.</p>
+    </form>
+    <div class="progress" id="progress">
+      <div class="bar"><div id="barfill"></div></div>
+      <div class="pmsg" id="pmsg"></div>
+    </div>
+    <div class="err" id="err"></div>
+  </div>
+
+  <div id="results"></div>
+
+  <footer>
+    <div class="footgrid">
+      <div>
+        <h4>Methodology</h4>
+        <ul>
+          <li>Principal = cumulative (deposits &minus; withdrawals) per pool, marked daily with Kraken closes (USDC = $1).</li>
+          <li>Deposits: transactions where the wallet sends USDC/WETH/cbBTC and the same transaction stakes LP into a Ryze vault. Plain swaps excluded; dust returned to the wallet is netted off.</li>
+          <li>Withdrawals: transactions that burn vault LP with underlying returned to the wallet.</li>
+          <li>Rewards = claimed (vault &rarr; wallet USDC transfers) + unclaimed (read live from each vault's claimable-rewards view).</li>
+          <li>Realized APR = rewards &divide; TWAP &times; 365/days. APY = (1+APR/52)<sup>52</sup>&minus;1 (weekly compounding).</li>
+        </ul>
+      </div>
+      <div>
+        <h4>Notes</h4>
+        <ul>
+          <li>Data: Blockscout (Base), Kraken (or Coinbase Exchange fallback) daily closes, Base public RPC &mdash; all client-side.</li>
+          <li>Analysis typically takes 20&ndash;60 seconds depending on wallet history.</li>
+          <li>Historical performance does not predict future returns. Not financial advice.</li>
+          <li>No cookies, no analytics, no trackers.</li>
+        </ul>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<script>
+/* ============================================================================
+ * Ryze LP performance engine — browser port of analyze_apr.py
+ *
+ * Pure logic, no DOM. Works in any modern browser (fetch) and in Node 18+.
+ * All computation runs client-side against public APIs:
+ *   - Blockscout v2 (Base): token transfer history + per-tx token transfers
+ *   - Kraken public OHLC: daily closes for ETH and BTC (USDC = $1)
+ *   - Public Base RPC (eth_call): claimable-rewards view per vault
+ *
+ * Method (mirrors the Python reference):
+ *   1. Claims  = vault -> wallet USDC transfers (>= $0.05).
+ *   2. Deposits = txs where the wallet sends USDC/WETH/cbBTC and the same tx
+ *      stakes an LP token into a Ryze gauge vault. Helper dust returned to
+ *      the wallet in the same tx is netted off. Plain swaps (no vault
+ *      stake in the tx) are excluded.
+ *   3. Withdrawals = txs where vault LP is burned (vault -> 0x0) and
+ *      underlying (USDC/WETH/cbBTC) is returned to the wallet.
+ *   4. Principal series per pool = cumulative (genesis + deposits -
+ *      withdrawals), marked daily with closes (USDC=$1).
+ *   5. TWAP, realized APR = rewards/TWAP * 365/days,
+ *      APY = (1+APR/52)^52 - 1.
+ *   6. Unclaimed rewards read live from each vault's claimable-rewards view.
+ *
+ * Wallet-specific history: the 2026-03-24/25 genesis stakes and the
+ * 2026-04-13/14 migration are one-time history that only applies to
+ * Hesham's wallet (0x3503...). They are NEVER applied to other wallets;
+ * for everyone else deposits/withdrawals are auto-detected only.
+ * ========================================================================== */
+
+const RyzeEngine = (() => {
+  'use strict';
+
+  // ------------------------------------------------------------- config ---
+  const WETH_VAULT = '0x82665512097280502Be785C5070090f628dE002F';
+  const CBBTC_VAULT = '0x5C6fBb8551E632dFA07DF3FcD98d1f3AA4F11252';
+  const PRE_WETH_VAULT = '0xe44bEdeFBe981729B6Bbbc7C8CE96bb93d27A253';
+  const PRE_CBBTC_VAULT = '0x8fBFFe829825B55C70190e7f8fEA55995ED0515d';
+  const HELPER = '0xCA8A097f627ef41Be12EbF7433F5B6b8A114D77b';
+  const OLD_HELPER = '0x1406Fd746969A6ef440BE24547433C1c28Dee803';
+  const USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
+  const ZERO = '0x0000000000000000000000000000000000000000';
+  const HESHAM = '0x3503f40b65a4dda32a84bfe4cd806b4dad4e2ea6';
+
+  const CLAIMABLE_SEL = '7a27db57'; // claimableRewards(address user, address token)
+
+  const BLOCKSCOUT = 'https://base.blockscout.com/api/v2';
+  const KRAKEN = 'https://api.kraken.com/0/public/OHLC';
+  const RPCS = [
+    'https://base.drpc.org',
+    'https://1rpc.io/base',
+    'https://mainnet.base.org',
+  ];
+
+  const TOKENS = ['USDC', 'WETH', 'CBBTC'];
+  const POOL_NAMES = { W: 'WETH-USDC', B: 'cbBTC-USDC' };
+
+  const CLAIM_VAULTS = {
+    [WETH_VAULT.slice(0, 10).toLowerCase()]: 'W',
+    [CBBTC_VAULT.slice(0, 10).toLowerCase()]: 'B',
+    [PRE_WETH_VAULT.slice(0, 10).toLowerCase()]: 'W',
+    [PRE_CBBTC_VAULT.slice(0, 10).toLowerCase()]: 'B',
+  };
+  const VAULT_SET = new Set(
+    [WETH_VAULT, CBBTC_VAULT, PRE_WETH_VAULT, PRE_CBBTC_VAULT].map((a) =>
+      a.toLowerCase()
+    )
+  );
+
+  function poolOf(addrLower) {
+    if (!addrLower) return null;
+    if (VAULT_SET.has(addrLower)) {
+      return (
+        CLAIM_VAULTS[addrLower.slice(0, 10)] ||
+        (addrLower.startsWith(WETH_VAULT.slice(0, 10).toLowerCase()) ||
+        addrLower.startsWith(PRE_WETH_VAULT.slice(0, 10).toLowerCase())
+          ? 'W'
+          : 'B')
+      );
+    }
+    return CLAIM_VAULTS[addrLower.slice(0, 10)] || null;
+  }
+
+  // One-time history — HESHAM'S WALLET ONLY. Never applied to strangers.
+  // Format: [date, pool 'W'/'B', usdc_delta, weth_delta, cbbtc_delta]
+  const HESHAM_GENESIS_EVENTS = [
+    ['2026-03-24', 'W', 7411.87, 3.1, 0.0],
+    ['2026-04-13', 'W', 6985.6 - 7411.87, 2.7909 - 3.1, 0.0],
+    ['2026-04-14', 'W', 6525.4907 + 493.7876 - 6985.6, 0.0, 0.0],
+    ['2026-03-25', 'B', 8726.0, 0.0, 0.0],
+    ['2026-04-13', 'B', 5045.44 - 8726.0, 0.0, 0.0452],
+    ['2026-04-14', 'B', 5011.7635 - 5045.44, 0.0, 0.0],
+  ];
+  // The 4/14 re-stakes recycled the 4/13 migration withdrawals; they are
+  // excluded from auto-detection for Hesham (booked as net deltas above).
+  const HESHAM_MIGRATION_RESTAKE_TXS = new Set(
+    [
+      '0x2e4a8f0efa5312d1b5c7a52cde64dd0968bc6146432a6007b876dfee0af8cbeb',
+      '0x9c61ed24dabf8bfcf471dd0f4714d7c2d860edd0300e05f1854ef25addcad218',
+      '0x0fdad9549f700bac24098eb03448f3d2b8766040b7fd3f732710a206c9eae933',
+    ].map((h) => h.toLowerCase())
+  );
+
+  // ------------------------------------------------------------- helpers --
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  async function fetchJSON(url, { postData = null, timeout = 30000, tries = 3 } = {}) {
+    let lastErr = null;
+    for (let i = 0; i < tries; i++) {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), timeout);
+      try {
+        const res = await fetch(url, {
+          method: postData ? 'POST' : 'GET',
+          headers: postData ? { 'Content-Type': 'application/json' } : {},
+          body: postData ? JSON.stringify(postData) : undefined,
+          signal: ctrl.signal,
+        });
+        clearTimeout(t);
+        if (!res.ok) throw new Error(`HTTP ${res.status} for ${url.slice(0, 80)}`);
+        return await res.json();
+      } catch (e) {
+        clearTimeout(t);
+        lastErr = e;
+        await sleep(800 * (i + 1));
+      }
+    }
+    throw lastErr;
+  }
+
+  async function getPaginated(url, onProgress) {
+    const items = [];
+    const seen = new Set();
+    let pp = '';
+    let page = 0;
+    for (;;) {
+      const d = await fetchJSON(url + pp, { tries: 4 });
+      const batch = d.items || [];
+      if (!batch.length) break;
+      for (const x of batch) {
+        const key = x.transaction_hash + '|' + x.log_index;
+        if (!seen.has(key)) {
+          seen.add(key);
+          items.push(x);
+        }
+      }
+      page++;
+      if (onProgress) onProgress(page, items.length);
+      const npp = d.next_page_params;
+      if (!npp) break;
+      pp =
+        '?' +
+        Object.entries(npp)
+          .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+          .join('&');
+      await sleep(150);
+    }
+    return items;
+  }
+
+  function amt(x) {
+    try {
+      return (
+        Number(x.total.value) / 10 ** Number(x.token.decimals)
+      );
+    } catch {
+      return 0;
+    }
+  }
+  function sym(x) {
+    return (x.token && x.token.symbol) || '?';
+  }
+  function addrOf(part) {
+    return ((part && part.hash) || '').toLowerCase();
+  }
+  function dayOf(x) {
+    return (x.timestamp || '').slice(0, 10);
+  }
+
+  const _txCache = new Map();
+  async function txTransfers(txHash) {
+    const h = txHash.toLowerCase();
+    if (!_txCache.has(h)) {
+      const d = await fetchJSON(
+        `${BLOCKSCOUT}/transactions/${txHash}/token-transfers`,
+        { tries: 4 }
+      );
+      _txCache.set(h, d.items || []);
+      await sleep(120);
+    }
+    return _txCache.get(h);
+  }
+
+  async function mapLimit(arr, limit, fn, onProgress) {
+    const out = new Array(arr.length);
+    let i = 0;
+    let done = 0;
+    async function worker() {
+      while (i < arr.length) {
+        const idx = i++;
+        out[idx] = await fn(arr[idx], idx);
+        done++;
+        if (onProgress) onProgress(done, arr.length);
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(limit, arr.length) }, worker));
+    return out;
+  }
+
+  // ------------------------------------------------------------- fetch ----
+  function fetchWalletTransfers(wallet, onProgress) {
+    return getPaginated(
+      `${BLOCKSCOUT}/addresses/${wallet}/token-transfers`,
+      onProgress
+    );
+  }
+
+  // Kraken daily closes, primary price source (matches reference engine).
+  async function fetchKrakenDaily(pair, start, end) {
+    const out = {};
+    const startMs = Date.UTC(
+      +start.slice(0, 4), +start.slice(5, 7) - 1, +start.slice(8, 10)
+    );
+    const endMs = Date.UTC(+end.slice(0, 4), +end.slice(5, 7) - 1, +end.slice(8, 10));
+    for (let dt = startMs; dt <= endMs; dt += 60 * 86400 * 1000) {
+      const since = Math.floor(dt / 1000);
+      const d = await fetchJSON(
+        `${KRAKEN}?pair=${pair}&interval=1440&since=${since}`,
+        { tries: 4 }
+      );
+      if (d.error && d.error.length) throw new Error('Kraken: ' + d.error.join('; '));
+      const key = Object.keys(d.result || {})[0];
+      for (const c of d.result[key] || []) {
+        const day = new Date(c[0] * 1000).toISOString().slice(0, 10);
+        if (day >= start && day <= end && !(day in out)) out[day] = parseFloat(c[4]);
+      }
+      await sleep(400);
+    }
+    return out;
+  }
+
+  // Coinbase Exchange daily candles — fallback if Kraken is unreachable.
+  // Returns {day: close}; close is index 4 just like Kraken.
+  async function fetchCoinbaseDaily(product, start, end) {
+    const out = {};
+    const iso = (ms) => new Date(ms).toISOString();
+    const startMs = Date.UTC(+start.slice(0, 4), +start.slice(5, 7) - 1, +start.slice(8, 10));
+    const endMs = Date.UTC(+end.slice(0, 4), +end.slice(5, 7) - 1, +end.slice(8, 10)) + 86400000;
+    // 300-candle limit per request; walk in 300-day chunks
+    for (let s = startMs; s < endMs; s += 300 * 86400000) {
+      const e = Math.min(s + 300 * 86400000, endMs);
+      const d = await fetchJSON(
+        `https://api.exchange.coinbase.com/products/${product}/candles` +
+          `?start=${encodeURIComponent(iso(s))}&end=${encodeURIComponent(iso(e))}&granularity=86400`,
+        { tries: 4 }
+      );
+      for (const c of d || []) {
+        const day = new Date(c[0] * 1000).toISOString().slice(0, 10);
+        if (day >= start && day <= end && !(day in out)) out[day] = parseFloat(c[4]);
+      }
+      await sleep(400);
+    }
+    return out;
+  }
+
+  async function fetchPrices(pair, coinbaseProduct, start, end, onProgress) {
+    try {
+      if (onProgress) onProgress(`prices:${pair}`, 'kraken');
+      return { src: 'Kraken', map: await fetchKrakenDaily(pair, start, end) };
+    } catch (e) {
+      if (onProgress) onProgress(`prices:${pair}`, 'coinbase-fallback');
+      return { src: 'Coinbase Exchange', map: await fetchCoinbaseDaily(coinbaseProduct, start, end) };
+    }
+  }
+
+  async function readUnclaimed(vault, wallet) {
+    const data =
+      '0x' +
+      CLAIMABLE_SEL +
+      wallet.slice(2).toLowerCase().padStart(64, '0') +
+      USDC.slice(2).toLowerCase().padStart(64, '0');
+    const body = {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'eth_call',
+      params: [{ to: vault, data }, 'latest'],
+    };
+    let lastErr = null;
+    for (const rpc of RPCS) {
+      try {
+        const r = await fetchJSON(rpc, { postData: body, tries: 2, timeout: 20000 });
+        if (r && typeof r.result === 'string' && r.result.startsWith('0x')) {
+          return Number(BigInt(r.result)) / 1e6;
+        }
+        throw new Error('bad rpc result');
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    const err = new Error('unclaimed-unavailable');
+    err.cause = lastErr;
+    throw err;
+  }
+
+  // ------------------------------------------------------------- analysis -
+  function extractClaims(transfers, wallet) {
+    const w = wallet.toLowerCase();
+    const claims = [];
+    for (const x of transfers) {
+      if (addrOf(x.to) !== w || sym(x) !== 'USDC') continue;
+      const a = amt(x);
+      if (a < 0.05) continue;
+      const pool = poolOf(addrOf(x.from));
+      if (pool) claims.push({ date: dayOf(x), pool, amount: Math.round(a * 1e4) / 1e4 });
+    }
+    claims.sort((p, q) =>
+      p.date < q.date ? -1 : p.date > q.date ? 1 : p.pool < q.pool ? -1 : 1
+    );
+    return claims;
+  }
+
+  // Find deposit txs: the wallet sends USDC/WETH/cbBTC in a tx that stakes an
+  // LP token into a Ryze gauge vault. For Hesham's wallet this mirrors the
+  // reference engine exactly (helper-prefix filter + migration exclusion).
+  // For other wallets the filter is generalized (any recipient), so deposits
+  // made through other routers/direct staking are also detected.
+  async function extractDeposits(transfers, wallet, { isHesham, onProgress }) {
+    const w = wallet.toLowerCase();
+    const helperPrefix = HELPER.slice(0, 14).toLowerCase();
+    const byTx = new Map();
+    for (const x of transfers) {
+      const fr = addrOf(x.from);
+      const to = addrOf(x.to);
+      if (fr !== w || to === w || to === ZERO) continue;
+      const s = sym(x);
+      if (!TOKENS.includes(s) || amt(x) < 0.005) continue;
+      if (isHesham) {
+        if (!to.startsWith(helperPrefix)) continue;
+        const h = (x.transaction_hash || '').toLowerCase();
+        if (HESHAM_MIGRATION_RESTAKE_TXS.has(h)) continue; // booked in genesis
+      }
+      const h = x.transaction_hash;
+      if (!byTx.has(h)) byTx.set(h, []);
+      byTx.get(h).push(x);
+    }
+    const txs = [...byTx.keys()].sort((a, b) => {
+      const da = Math.min(...byTx.get(a).map((t) => dayOf(t) || '9'));
+      const db = Math.min(...byTx.get(b).map((t) => dayOf(t) || '9'));
+      return da < db ? -1 : 1;
+    });
+    const deposits = [];
+    await mapLimit(
+      txs,
+      4,
+      async (h) => {
+        const items = await txTransfers(h);
+        let pool = null;
+        const inputs = { USDC: 0, WETH: 0, CBBTC: 0 };
+        const dust = { USDC: 0, WETH: 0, CBBTC: 0 };
+        for (const y of items) {
+          const s = sym(y);
+          const a = amt(y);
+          const to = addrOf(y.to);
+          const fr = addrOf(y.from);
+          // LP token staked into a vault? (plain USDC/WETH/cbBTC excluded)
+          if (!TOKENS.includes(s)) {
+            const p = poolOf(to);
+            if (p) pool = p;
+          }
+          if (fr === w && TOKENS.includes(s)) inputs[s] += a;
+          // funds returned to the wallet in the same tx are netted off;
+          // vault -> wallet USDC is a *claim* (counted separately), not dust
+          if (to === w && fr !== w && !VAULT_SET.has(fr) && TOKENS.includes(s)) {
+            if (isHesham) {
+              if (fr === HELPER.toLowerCase()) dust[s] += a;
+            } else {
+              dust[s] += a;
+            }
+          }
+        }
+        if (pool) {
+          const ts = byTx.get(h).map((t) => dayOf(t)).sort()[0];
+          const net = {};
+          for (const k of TOKENS) {
+            const v = Math.round((inputs[k] - dust[k]) * 1e4) / 1e4;
+            if (v > 0) net[k] = v;
+          }
+          deposits.push({ date: ts, pool, net, tx: h });
+        }
+      },
+      onProgress
+    );
+    deposits.sort((p, q) => (p.date < q.date ? -1 : 1));
+    return deposits;
+  }
+
+  // Find withdrawal txs: vault LP burned (vault -> 0x0) with underlying
+  // returned to the wallet in the same tx.
+  async function extractWithdrawals(transfers, wallet, { isHesham, onProgress }) {
+    const w = wallet.toLowerCase();
+    const helperL = HELPER.toLowerCase();
+    const oldHelperL = OLD_HELPER.toLowerCase();
+    const byTx = new Map();
+    for (const x of transfers) {
+      const fr = addrOf(x.from);
+      const to = addrOf(x.to);
+      if (to !== w) continue;
+      const s = sym(x);
+      if (!TOKENS.includes(s) || amt(x) < 0.01) continue;
+      const viaHelper = fr === helperL;
+      const viaOldHelper = !isHesham && fr === oldHelperL;
+      const viaVault = !isHesham && VAULT_SET.has(fr);
+      if (!(viaHelper || viaOldHelper || viaVault)) continue;
+      const h = x.transaction_hash;
+      if (!byTx.has(h)) byTx.set(h, []);
+      byTx.get(h).push(x);
+    }
+    const txs = [...byTx.keys()].sort((a, b) => {
+      const da = Math.min(...byTx.get(a).map((t) => dayOf(t) || '9'));
+      const db = Math.min(...byTx.get(b).map((t) => dayOf(t) || '9'));
+      return da < db ? -1 : 1;
+    });
+    const withdrawals = [];
+    await mapLimit(
+      txs,
+      4,
+      async (h) => {
+        const items = await txTransfers(h);
+        let burnPool = null;
+        for (const y of items) {
+          const fr = addrOf(y.from);
+          if ((VAULT_SET.has(fr) || poolOf(fr)) && addrOf(y.to) === ZERO) {
+            burnPool = poolOf(fr);
+            break;
+          }
+        }
+        if (!burnPool) return; // payout without a vault unstake: not a withdrawal
+        const out = { USDC: 0, WETH: 0, CBBTC: 0 };
+        for (const y of items) {
+          const s = sym(y);
+          const a = amt(y);
+          if (addrOf(y.to) !== w || !TOKENS.includes(s)) continue;
+          const fr = addrOf(y.from);
+          if (fr === helperL || fr === oldHelperL) out[s] += a;
+          else if (VAULT_SET.has(fr) && (s === 'WETH' || s === 'CBBTC')) {
+            out[s] += a; // principal returned directly, not via helper
+          }
+          // vault -> wallet USDC in an unstake tx is the reward claim
+          // (counted by extractClaims), not principal — excluded here.
+        }
+        if (Object.values(out).some((v) => v > 0)) {
+          const ts = byTx.get(h).map((t) => dayOf(t)).sort()[0];
+          const net = {};
+          for (const k of TOKENS) {
+            const v = Math.round(out[k] * 1e4) / 1e4;
+            if (v > 0) net[k] = v;
+          }
+          withdrawals.push({ date: ts, pool: burnPool, net, tx: h });
+        }
+      },
+      onProgress
+    );
+    withdrawals.sort((p, q) => (p.date < q.date ? -1 : 1));
+    return withdrawals;
+  }
+
+  function buildSeries(events, flows, prices, start, end) {
+    // events: [[date, pool, du, dw, db]] ; flows: [{date, pool, net, sign}]
+    const ev = {};
+    const add = (date, pool, du, de, db) => {
+      if (!ev[date]) ev[date] = [];
+      ev[date].push([pool, du, de, db]);
+    };
+    for (const [date, pool, du, de, db] of events) add(date, pool, du, de, db);
+    for (const f of flows) {
+      add(f.date, f.pool, f.net.USDC || 0, f.net.WETH || 0, f.net.CBBTC || 0);
+    }
+    const ETH = prices.ETH.map, BTC = prices.BTC.map;
+    const bal = { W: [0, 0, 0], B: [0, 0, 0] }; // usdc, weth, cbbtc
+    const tw = { W: 0, B: 0 };
+    let n = 0;
+    let dms = Date.UTC(+start.slice(0, 4), +start.slice(5, 7) - 1, +start.slice(8, 10));
+    const endMs = Date.UTC(+end.slice(0, 4), +end.slice(5, 7) - 1, +end.slice(8, 10));
+    for (; dms <= endMs; dms += 86400000) {
+      const s = new Date(dms).toISOString().slice(0, 10);
+      for (const [pool, du, de, db] of ev[s] || []) {
+        const b = bal[pool];
+        b[0] += du; b[1] += de; b[2] += db;
+      }
+      tw.W += bal.W[0] + bal.W[1] * (ETH[s] || 0);
+      tw.B += bal.B[0] + bal.B[2] * (BTC[s] || 0);
+      n++;
+    }
+    return { twap: { W: tw.W / n, B: tw.B / n }, days: n, endBal: bal };
+  }
+
+  function pacificToday() {
+    return new Date().toLocaleDateString('en-CA', {
+      timeZone: 'America/Los_Angeles',
+    });
+  }
+
+  async function analyze(walletInput, { today = null, onProgress = null } = {}) {
+    _txCache.clear();
+    const prog = onProgress || (() => {});
+    const wallet = walletInput.trim();
+    if (!/^0x[0-9a-fA-F]{40}$/.test(wallet)) {
+      throw new Error('invalid-address');
+    }
+    const isHesham = wallet.toLowerCase() === HESHAM;
+    const end = today || pacificToday();
+
+    prog('transfers', 0, 0, 'Fetching transfer history from Blockscout…');
+    const transfers = await fetchWalletTransfers(wallet, (page, count) =>
+      prog('transfers', page, 0, `Fetching transfer history… (${count} transfers so far)`)
+    );
+    prog('transfers', 1, 1, `${transfers.length} transfers found. Detecting claims…`);
+    const claims = extractClaims(transfers, wallet);
+
+    prog('deposits', 0, 1, 'Detecting deposits…');
+    const deposits = await extractDeposits(transfers, wallet, {
+      isHesham,
+      onProgress: (done, total) =>
+        prog('deposits', done, total, `Analyzing deposit transactions… (${done}/${total})`),
+    });
+    prog('withdrawals', 0, 1, 'Detecting withdrawals…');
+    const withdrawals = await extractWithdrawals(transfers, wallet, {
+      isHesham,
+      onProgress: (done, total) =>
+        prog('withdrawals', done, total, `Analyzing withdrawal transactions… (${done}/${total})`),
+    });
+
+    const genesis = isHesham ? HESHAM_GENESIS_EVENTS : [];
+    const cands = [
+      ...claims.map((c) => c.date),
+      ...genesis.map((e) => e[0]),
+      ...deposits.map((d) => d.date),
+      ...withdrawals.map((d) => d.date),
+    ].filter(Boolean);
+    const firstDay = cands.length ? cands.sort()[0] : null;
+
+    // Read unclaimed rewards regardless — needed for the empty-state check too.
+    prog('unclaimed', 0, 2, 'Reading unclaimed rewards on-chain…');
+    let unclaimed = { W: 0, B: 0 };
+    let unclaimedOk = true;
+    try {
+      unclaimed.W = await readUnclaimed(WETH_VAULT, wallet);
+      prog('unclaimed', 1, 2, 'Reading unclaimed rewards on-chain…');
+      unclaimed.B = await readUnclaimed(CBBTC_VAULT, wallet);
+    } catch (e) {
+      unclaimedOk = false;
+    }
+    prog('unclaimed', 2, 2, 'Unclaimed rewards read.');
+
+    if (!firstDay) {
+      const totalUnclaimed = unclaimed.W + unclaimed.B;
+      if (unclaimedOk && totalUnclaimed > 0.005) {
+        return {
+          wallet, end, firstDay: null, days: 0, isHesham,
+          transfers: transfers.length,
+          partial: true,
+          pools: {
+            W: { rewards: unclaimed.W, unclaimed: unclaimed.W, claimed: 0, nClaims: 0 },
+            B: { rewards: unclaimed.B, unclaimed: unclaimed.B, claimed: 0, nClaims: 0 },
+          },
+          unclaimedOk,
+        };
+      }
+      return { wallet, end, firstDay: null, days: 0, isHesham, transfers: transfers.length, empty: true, unclaimedOk };
+    }
+
+    prog('prices', 0, 2, 'Fetching daily ETH prices…');
+    const ETH = await fetchPrices('ETHUSD', 'ETH-USD', firstDay, end, (k, v) =>
+      prog('prices', 0, 2, v === 'kraken' ? 'Fetching daily ETH prices (Kraken)…' : 'Kraken unreachable — using Coinbase prices…')
+    );
+    prog('prices', 1, 2, 'Fetching daily BTC prices…');
+    const BTC = await fetchPrices('XBTUSD', 'BTC-USD', firstDay, end, (k, v) =>
+      prog('prices', 1, 2, v === 'kraken' ? 'Fetching daily BTC prices (Kraken)…' : 'Kraken unreachable — using Coinbase prices…')
+    );
+    const prices = { ETH, BTC };
+    const priceSource = ETH.src === BTC.src ? ETH.src : `${ETH.src} / ${BTC.src}`;
+
+    prog('compute', 0, 1, 'Computing time-weighted principal…');
+    const flows = [
+      ...deposits.map((d) => ({ date: d.date, pool: d.pool, net: d.net })),
+      ...withdrawals.map((d) => ({
+        date: d.date,
+        pool: d.pool,
+        net: {
+          USDC: -(d.net.USDC || 0),
+          WETH: -(d.net.WETH || 0),
+          CBBTC: -(d.net.CBBTC || 0),
+        },
+      })),
+    ];
+    const { twap, days, endBal } = buildSeries(genesis, flows, prices, firstDay, end);
+
+    const pools = {};
+    for (const q of ['W', 'B']) {
+      const claimed = claims.filter((c) => c.pool === q).reduce((s, c) => s + c.amount, 0);
+      const nClaims = claims.filter((c) => c.pool === q).length;
+      const rewards = claimed + (unclaimedOk ? unclaimed[q] : 0);
+      const t = twap[q];
+      const apr = t > 0 ? (rewards / t) * (365 / days) : 0;
+      pools[q] = {
+        name: POOL_NAMES[q],
+        rewards,
+        twap: t,
+        apr,
+        apy: (1 + apr / 52) ** 52 - 1,
+        claimed,
+        nClaims,
+        unclaimed: unclaimedOk ? unclaimed[q] : 0,
+        principalKnown: t > 0,
+      };
+    }
+    const bTwap = pools.W.twap + pools.B.twap;
+    const bRew = pools.W.rewards + pools.B.rewards;
+    const bApr = bTwap > 0 ? (bRew / bTwap) * (365 / days) : 0;
+    const blended = {
+      rewards: bRew,
+      twap: bTwap,
+      apr: bApr,
+      apy: (1 + bApr / 52) ** 52 - 1,
+      principalKnown: bTwap > 0,
+    };
+    prog('compute', 1, 1, 'Done.');
+
+    return {
+      wallet, end, firstDay, days, isHesham,
+      pools, blended,
+      claims: claims.length,
+      deposits: deposits.length,
+      withdrawals: withdrawals.length,
+      transfers: transfers.length,
+      unclaimedOk,
+      priceSource,
+      endBal,
+    };
+  }
+
+  return { analyze, POOL_NAMES, HESHAM };
+})();
+
+
+</script>
+<script>
+/* UI wiring for the Ryze LP performance checker. Runs after RyzeEngine. */
+(() => {
+  'use strict';
+
+  const form = document.getElementById('form');
+  const addrInput = document.getElementById('addr');
+  const goBtn = document.getElementById('go');
+  const progressEl = document.getElementById('progress');
+  const barFill = document.getElementById('barfill');
+  const pmsg = document.getElementById('pmsg');
+  const errEl = document.getElementById('err');
+  const resultsEl = document.getElementById('results');
+
+  const money = (n) =>
+    n.toLocaleString('en-US', { style: 'currency', currency: 'USD' });
+  const pct = (x) => (x * 100).toFixed(2) + '%';
+  const esc = (s) =>
+    String(s).replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    })[c]);
+  const shortAddr = (a) => a.slice(0, 6) + '…' + a.slice(-6);
+
+  // stage -> [from%, to%]
+  const STAGES = {
+    transfers: [0, 38],
+    deposits: [38, 58],
+    withdrawals: [58, 68],
+    unclaimed: [68, 74],
+    prices: [74, 90],
+    compute: [90, 100],
+  };
+
+  function setProgress(stage, done, total, msg) {
+    const [a, b] = STAGES[stage] || [0, 0];
+    let frac = 0;
+    if (total > 0) frac = Math.min(1, done / total);
+    else if (done > 0) frac = 1;
+    barFill.style.width = (a + (b - a) * frac).toFixed(1) + '%';
+    if (msg) pmsg.textContent = msg;
+  }
+
+  function showError(text) {
+    errEl.textContent = text;
+    errEl.classList.add('on');
+  }
+  function clearError() {
+    errEl.classList.remove('on');
+    errEl.textContent = '';
+  }
+
+  function poolCard(q, p) {
+    const aprHtml = p.principalKnown
+      ? `<div class="apr">${pct(p.apr)}</div>`
+      : `<div class="apr na">n/a</div>`;
+    const note = p.principalKnown
+      ? ''
+      : `<div class="hint">Principal not detected for this pool, so APR/APY can't be computed.</div>`;
+    return `
+      <div class="pool">
+        <h3>${esc(p.name)}</h3>
+        ${aprHtml}
+        <table>
+          <tr><td>APY (weekly-comp)</td><td>${p.principalKnown ? pct(p.apy) : '<span class="na">n/a</span>'}</td></tr>
+          <tr><td>Total rewards</td><td>${money(p.rewards)}</td></tr>
+          <tr><td>Time-weighted principal</td><td>${money(p.twap)}</td></tr>
+          <tr><td>Claimed (${p.nClaims})</td><td>${money(p.claimed)}</td></tr>
+          <tr><td>Unclaimed</td><td>${money(p.unclaimed)}</td></tr>
+        </table>
+        ${note}
+      </div>`;
+  }
+
+  function render(r) {
+    if (r.empty) {
+      resultsEl.innerHTML = `
+        <div class="notice">No Ryze LP activity found for
+          <code>${esc(shortAddr(r.wallet))}</code>. This address has no detected
+          deposits, withdrawals, or reward claims in the Ryze gauge vaults.</div>`;
+      resultsEl.classList.add('on');
+      return;
+    }
+    if (r.partial) {
+      const tot = r.pools.W.rewards + r.pools.B.rewards;
+      resultsEl.innerHTML = `
+        <p class="walletline">Wallet <code>${esc(r.wallet)}</code></p>
+        <div class="notice">This address has <b>${money(tot)}</b> in unclaimed Ryze
+          rewards, but no deposit history could be reconstructed from its transfer
+          history, so APR can't be computed. (WETH-USDC: ${money(r.pools.W.rewards)} ·
+          cbBTC-USDC: ${money(r.pools.B.rewards)})</div>`;
+      resultsEl.classList.add('on');
+      return;
+    }
+
+    const b = r.blended;
+    const unclaimedWarn = r.unclaimedOk
+      ? ''
+      : `<div class="notice">Live unclaimed-rewards lookup failed (RPC unreachable);
+         rewards below reflect claimed amounts only.</div>`;
+    const priceNote =
+      r.priceSource === 'Kraken'
+        ? ''
+        : `<div class="hint">Price source: ${esc(r.priceSource)} (Kraken unreachable).</div>`;
+
+    resultsEl.innerHTML = `
+      <p class="walletline">Wallet <code>${esc(r.wallet)}</code> · Base ·
+        ${esc(r.firstDay)} → ${esc(r.end)} (${r.days} days)</p>
+      ${unclaimedWarn}
+      <div class="blend">
+        <div class="k">Blended realized APR</div>
+        <div class="big">${b.principalKnown ? pct(b.apr) : 'n/a'}</div>
+        <div class="row2">
+          <div class="stat"><div class="k">APY</div><div class="v">${b.principalKnown ? pct(b.apy) : 'n/a'}</div></div>
+          <div class="stat"><div class="k">Rewards</div><div class="v">${money(b.rewards)}</div></div>
+          <div class="stat"><div class="k">Time-weighted principal</div><div class="v">${money(b.twap)}</div></div>
+        </div>
+      </div>
+      <div class="pools">
+        ${poolCard('W', r.pools.W)}
+        ${poolCard('B', r.pools.B)}
+      </div>
+      <div class="card" style="margin-bottom:0">
+        <div class="meta">
+          <span>Transfers analyzed <b>${r.transfers}</b></span>
+          <span>Claims <b>${r.claims}</b></span>
+          <span>Deposits <b>${r.deposits}</b></span>
+          <span>Withdrawals <b>${r.withdrawals}</b></span>
+        </div>
+        ${priceNote}
+      </div>`;
+    resultsEl.classList.add('on');
+  }
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    clearError();
+    resultsEl.classList.remove('on');
+    const wallet = addrInput.value.trim();
+    if (!/^0x[0-9a-fA-F]{40}$/.test(wallet)) {
+      showError('That doesn\'t look like a valid Base address — it should be 0x followed by 40 hex characters.');
+      return;
+    }
+    goBtn.disabled = true;
+    progressEl.classList.add('on');
+    barFill.style.width = '0%';
+    try {
+      const r = await RyzeEngine.analyze(wallet, { onProgress: setProgress });
+      barFill.style.width = '100%';
+      pmsg.textContent = 'Done.';
+      render(r);
+    } catch (err) {
+      console.error(err);
+      if (err && err.message === 'invalid-address') {
+        showError('Invalid address format.');
+      } else {
+        showError(
+          'Something went wrong while fetching data (' +
+            (err && err.message ? err.message : 'network error') +
+            '). Please check your connection and try again.'
+        );
+      }
+    } finally {
+      goBtn.disabled = false;
+      setTimeout(() => progressEl.classList.remove('on'), 1200);
+    }
+  });
+})();
+
+</script>
+</body>
+</html>
