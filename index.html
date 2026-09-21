@@ -109,22 +109,23 @@
       <div>
         <h4>Methodology</h4>
         <ul>
-          <li>Principal = cumulative (deposits &minus; withdrawals) per pool, marked daily with Kraken closes (USDC = $1).</li>
+          <li>Cost basis = FIFO cost basis of what's in the pool: each deposit is valued at that day's close (Kraken daily closes, USDC = $1); withdrawals consume the oldest lots first at their original cost. Market moves after a deposit never change cost basis.</li>
+          <li>Current value = what's still in the pool at today's closes. The gap between current value and cost basis is market gain or loss.</li>
           <li>Deposits: transactions where the wallet sends USDC/WETH/cbBTC and the same transaction deposits LP into a Ryze pool. Plain swaps excluded; dust returned to the wallet is netted off.</li>
           <li>Withdrawals: transactions that burn pool LP with underlying returned to the wallet.</li>
           <li>Rewards = claimed (pool &rarr; wallet USDC transfers) + unclaimed (read live from each pool's claimable-rewards view).</li>
-          <li>Realized APR = rewards &divide; TWAP &times; 365/days. APY = (1+APR/52)<sup>52</sup>&minus;1 (weekly compounding).</li>
+          <li>Realized APR = rewards &divide; cost basis &times; 365/days (cost basis is the time-weighted average over the window). APY = (1+APR/52)<sup>52</sup>&minus;1 (weekly compounding).</li>
         </ul>
         <details class="deet">
-          <summary>How time-weighted principal is computed, step by step</summary>
+          <summary>How cost basis is computed, step by step</summary>
           <ol>
-            <li><b>Find the flows.</b> Every deposit and withdrawal becomes a dated entry: date, pool, and token amounts (USDC / WETH / cbBTC). Claims never touch principal.</li>
+            <li><b>Find the flows.</b> Every deposit and withdrawal becomes a dated entry: date, pool, and token amounts (USDC / WETH / cbBTC). Claims never touch cost basis.</li>
             <li><b>Pool migrations net out.</b> When a withdrawal is followed within 2 days by deposits into the same pool (e.g. a pool migration: withdraw from the old pool, deposit into the new one), the pair is netted to its capital delta &mdash; only genuinely new money counts as a deposit.</li>
-            <li><b>Walk every day.</b> Starting from the first activity day through today, each day's flows are applied to running per-pool balances, which are then marked to market: USDC counts at $1, WETH at that day's ETH close, cbBTC at that day's BTC close (Kraken daily closes, Coinbase Exchange fallback). Balances can't go below zero.</li>
-            <li><b>Average it.</b> Time-weighted principal (TWAP) is the average of those daily USD balances, per pool. The blended figure is the sum of both pools.</li>
-            <li><b>Divide rewards by TWAP.</b> Realized APR = total rewards &divide; TWAP &times; 365 &divide; days in the window.</li>
+            <li><b>Build FIFO lots, day by day.</b> Starting from the first activity day through today, each day's deposits push a cost-basis lot valued at that day's close (USDC at $1, WETH at the ETH close, cbBTC at the BTC close &mdash; Kraken daily closes, Coinbase Exchange fallback). Each day's withdrawals consume the oldest lots first at their original cost. Cost basis can never go negative.</li>
+            <li><b>Time-weight it.</b> Cost basis is the average of the daily cost-basis balances, per pool. The blended figure is the sum of both pools. Because each lot carries its deposit-day price, market moves after a flow never change cost basis &mdash; so the APR is pure yield, not price appreciation.</li>
+            <li><b>Divide rewards by cost basis.</b> Realized APR = total rewards &divide; cost basis &times; 365 &divide; days in the window.</li>
           </ol>
-          <p class="fine">Limits, stated plainly: principal is reconstructed from funds <b>the wallet itself</b> sends &mdash; deposits funded directly by a third party can't be attributed from transfer history alone. The figure is <b>rewards-only</b>: it measures reward payouts against principal, not total position P&amp;L (no impermanent loss, no in-pool fee accrual).</p>
+          <p class="fine">Limits, stated plainly: cost basis is reconstructed from funds <b>the wallet itself</b> sends &mdash; deposits funded directly by a third party can't be attributed from transfer history alone. The figure is <b>rewards-only</b>: it measures reward payouts against cost basis, not total position P&amp;L (no impermanent loss, no in-pool fee accrual).</p>
         </details>
       </div>
       <div>
