@@ -70,7 +70,6 @@ function hero(b) {
 ${stat('APY', b.principalKnown ? pct(b.apy) : 'n/a')}
 ${stat('Rewards', money(b.rewards))}
 ${stat('Total cost basis', money(b.gross))}
-${stat('Capital at work', money(b.twap))}
 ${stat('Current value', money(b.curVal))}
 </tr></table>
 </td></tr></table>`;
@@ -93,7 +92,6 @@ ${aprLine}
 ${row('APY (weekly-comp)', p.principalKnown ? pct(p.apy) : '<span style="color:#8a97a8;">n/a</span>')}
 ${row('Total rewards', money(p.rewards))}
 ${row('Total cost basis', money(p.gross))}
-${row('Capital at work', money(p.twap))}
 ${row('Current value', money(p.curVal))}
 ${row(`Claimed (${p.nClaims})`, money(p.claimed))}
 ${row('Unclaimed', money(p.unclaimed))}
@@ -170,7 +168,7 @@ function fullEmail(r, ctx) {
 
   const poolText = (p) =>
     p.principalKnown
-      ? `${p.name}: ${pct(p.apr)} APR (${pct(p.apy)} APY) — ${money(p.rewards)} rewards; ${money(p.gross)} total cost basis, ${money(p.twap)} capital at work; current value ${money(p.curVal)}`
+      ? `${p.name}: ${pct(p.apr)} APR (${pct(p.apy)} APY) — ${money(p.rewards)} rewards; ${money(p.gross)} total cost basis; current value ${money(p.curVal)}`
       : `${p.name}: n/a — capital at work not detected (${money(p.rewards)} rewards)`;
   const calcText = (p) => {
     if (!p.calc || !p.calc.length) return '';
@@ -182,7 +180,7 @@ function fullEmail(r, ctx) {
   const text =
     `Your weekly Ryze LP digest\n${r.firstDay} → ${r.end} (${r.days} days)\nWallet: ${r.wallet}\n\n` +
     `Blended: ${b.principalKnown ? pct(b.apr) + ' APR (' + pct(b.apy) + ' APY)' : 'n/a — capital at work not detected'}\n` +
-    `Total cost basis: ${money(b.gross)}    Capital at work: ${money(b.twap)}    Current value: ${money(b.curVal)}\n` +
+    `Total cost basis: ${money(b.gross)}    Current value: ${money(b.curVal)}\n` +
     `Total rewards: ${money(b.rewards)} (claimed ${money(r.pools.W.claimed + r.pools.B.claimed)} + unclaimed ${money(r.pools.W.unclaimed + r.pools.B.unclaimed)})\n\n` +
     poolText(r.pools.W) + calcText(r.pools.W) + '\n' + poolText(r.pools.B) + calcText(r.pools.B) + '\n\n' +
     `Method: total cost basis is the actual amount committed, before the protocol converts it into the pool position. Capital at work time-weights that over the window, and the APR is figured on capital at work. Market moves never change either number, so the APR is pure yield, not price appreciation.` +
