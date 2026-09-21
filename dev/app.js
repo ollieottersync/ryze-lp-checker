@@ -18,7 +18,64 @@
     String(s).replace(/[&<>"']/g, (c) => ({
       '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
     })[c]);
-  const shortAddr = (a) => a.slice(0, 6) + '…' + a.slice(-6);
+  const prettyDate = (d) => {
+    try {
+      return new Date(d + 'T12:00:00').toLocaleDateString('en-US', {
+        month: 'short',
+        day: 'numeric',
+      });
+    } catch {
+      return d;
+    }
+  };
+
+  // "See how this is calculated" expander: per-pool deposit math.
+  function calcDetails(r) {
+    const secs = ['W', 'B']
+      .map((q) => {
+        const p = r.pools[q];
+        if (!p.calc || !p.calc.length) return '';
+        const lines = p.calc
+          .map(
+            (d) =>
+              `<li>${money(d.total)} deposited ${prettyDate(d.date)} &times; ` +
+              `${d.daysActive}/${r.days} days = <b>${money(d.contrib)}</b></li>`
+          )
+          .join('');
+        const note = p.calcExact
+          ? `Adds up to the ${money(p.twap)} capital at work. The APR divides ` +
+            `rewards by capital at work, not by total cost basis &mdash; money only ` +
+            `counts for the days it was actually in the pool.`
+          : `This pool has withdrawals, so its capital-at-work figure reflects FIFO lot ` +
+            `accounting rather than the simple sum above &mdash; the deposits ` +
+            `show what went in and when.`;
+        return `<h4 style="margin:10px 0 4px;font-size:0.85rem">${esc(p.name)}</h4>` +
+          `<p style="margin:0 0 4px">Total cost basis <b>${money(p.gross)}</b> ` +
+          `&rarr; capital at work <b>${money(p.twap)}</b></p>` +
+          `<ul style="margin:4px 0;padding-left:20px">${lines}</ul>` +
+          `<p class="fine" style="margin:4px 0 0">${note}</p>`;
+      })
+      .filter(Boolean)
+      .join('');
+    if (!secs) return '';
+    return `
+      <details class="deet">
+        <summary>See how this is calculated</summary>
+        <div style="padding:2px 14px 12px;font-size:0.82rem">
+          ${secs}
+          <p class="fine" style="margin:10px 0 0">Total cost basis is the actual amount ` +
+      `that went in, before the protocol converted it into the pool position &mdash; ` +
+      `the purest comparable figure, since Ryze pools aren't 50/50 and the converted ` +
+      `split differs with every deposit. Capital at work is the time-weighted capital ` +
+      `the APR is figured on: a deposit made later in the window counts for fewer days, ` +
+      `which is why it can read lower than total cost basis. (Converting the deposit ` +
+      `into the pool position also costs a small amount in swap fees &mdash; typically ` +
+      `a few dollars per deposit.) Market moves never change either number, so the APR ` +
+      `is pure yield, not price appreciation. Current value is what's still in the pool ` +
+      `at today's prices &mdash; the gap between the two is market gain or loss.</p>
+        </div>
+      </details>`;
+  }
 
   // stage -> [from%, to%]
   const STAGES = {
@@ -54,7 +111,7 @@
       : `<div class="apr na">n/a</div>`;
     const note = p.principalKnown
       ? ''
-      : `<div class="hint">Cost basis not detected for this pool, so APR/APY can't be computed.</div>`;
+      : `<div class="hint">Capital at work couldn't be measured for this pool, so APR/APY can't be computed.</div>`;
     return `
       <div class="pool">
         <h3>${esc(p.name)}</h3>
@@ -62,7 +119,8 @@
         <table>
           <tr><td>APY (weekly-comp)</td><td>${p.principalKnown ? pct(p.apy) : '<span class="na">n/a</span>'}</td></tr>
           <tr><td>Total rewards</td><td>${money(p.rewards)}</td></tr>
-          <tr><td>Cost basis</td><td>${money(p.twap)}</td></tr>
+          <tr><td>Total cost basis</td><td>${money(p.gross)}</td></tr>
+          <tr><td>Capital at work</td><td>${money(p.twap)}</td></tr>
           <tr><td>Current value</td><td>${money(p.curVal)}</td></tr>
           <tr><td>Claimed (${p.nClaims})</td><td>${money(p.claimed)}</td></tr>
           <tr><td>Unclaimed</td><td>${money(p.unclaimed)}</td></tr>
@@ -112,7 +170,8 @@
         <div class="row2">
           <div class="stat"><div class="k">APY</div><div class="v">${b.principalKnown ? pct(b.apy) : 'n/a'}</div></div>
           <div class="stat"><div class="k">Rewards</div><div class="v">${money(b.rewards)}</div></div>
-          <div class="stat"><div class="k">Cost basis</div><div class="v">${money(b.twap)}</div></div>
+          <div class="stat"><div class="k">Total cost basis</div><div class="v">${money(b.gross)}</div></div>
+          <div class="stat"><div class="k">Capital at work</div><div class="v">${money(b.twap)}</div></div>
           <div class="stat"><div class="k">Current value</div><div class="v">${money(b.curVal)}</div></div>
         </div>
       </div>
@@ -128,10 +187,7 @@
           <span>Withdrawals <b>${r.withdrawals}</b></span>
           ${r.migrations ? `<span>Pool migrations netted <b>${r.migrations}</b></span>` : ''}
         </div>
-        <div class="hint">Cost basis is what you put in, priced on deposit day.
-          Market moves never change it, so the APR is pure yield, not price
-          appreciation. Current value is what's still in the pool at today's
-          prices — the gap between the two is market gain or loss.</div>
+        ${calcDetails(r)}
         ${priceNote}
       </div>`;
     resultsEl.classList.add('on');
@@ -156,8 +212,16 @@
       barFill.style.width = '100%';
       pmsg.textContent = 'Done.';
       render(r);
+      // Digest hook (stable contract for the weekly-digest automation):
+      // the full analyze() result is exposed at window.__ryzeDigestResult and
+      // documentElement[data-digest-ready] flips to "1" (or "error" below).
+      // Empty/partial results are valid digest payloads too.
+      window.__ryzeDigestResult = r;
+      document.documentElement.dataset.digestReady = '1';
     } catch (err) {
       console.error(err);
+      window.__ryzeDigestError = (err && err.message) || 'network error';
+      document.documentElement.dataset.digestReady = 'error';
       if (err && err.message === 'invalid-address') {
         showError('Invalid address format.');
       } else if (err && /HTTP 429/.test(err.message || '')) {
@@ -178,4 +242,17 @@
       setTimeout(() => progressEl.classList.remove('on'), 1200);
     }
   });
+
+  // ?wallet=0x… autoplay: fills the address and runs the analysis on load.
+  // Used by the weekly-digest automation (headless browser); also handy for
+  // shared links. Only fires for a syntactically valid address.
+  try {
+    const q = (new URLSearchParams(location.search).get('wallet') || '').trim();
+    if (/^0x[0-9a-fA-F]{40}$/.test(q)) {
+      addrInput.value = q;
+      setTimeout(() => form.requestSubmit(), 300);
+    }
+  } catch {
+    /* malformed URL — ignore */
+  }
 })();
