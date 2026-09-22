@@ -4,7 +4,9 @@
  * Pure logic, no DOM. Works in any modern browser (fetch) and in Node 18+.
  * All computation runs client-side against public APIs:
  *   - Blockscout v2 (Base): token transfer history + per-tx token transfers
- *   - Kraken public OHLC: daily closes for ETH and BTC (USDC = $1)
+ *   - Hourly closes for ETH and BTC (USDC = $1): bundled history in
+ *     data/kraken-hourly.json (deep history via Coinbase, recent tail via
+ *     Kraken) + a live Kraken refresh of the trailing 30h
  *   - Public Base RPC (eth_call): claimable-rewards view per pool
  *
  * Method (mirrors the Python reference):
@@ -89,6 +91,27 @@ const RyzeEngine = (() => {
       a.toLowerCase()
     )
   );
+
+  // Burners that count in a genuine withdrawal: the gauges, the pools
+  // themselves, the zap helpers, and the legacy contracts.
+  const RYZE_BURNERS = new Set(
+    [
+      WETH_VAULT,
+      CBBTC_VAULT,
+      PRE_WETH_VAULT,
+      PRE_CBBTC_VAULT,
+      RYZE_POOLS.W,
+      RYZE_POOLS.B,
+      HELPER,
+      OLD_HELPER,
+    ].map((a) => a.toLowerCase())
+  );
+
+  // Ryze pool LP tokens (each pool contract is its own LP token — verified
+  // on-chain via symbol()). A withdrawal must burn one of these; burns of
+  // other protocols' LP tokens (Beefy/Aerodrome/Maverick vault exits, etc.)
+  // are not withdrawals, no matter who burns them.
+  const LP_SYMS = new Set(['WETH-USDC', 'cbBTC-USDC']);
 
   function poolOf(addrLower) {
     if (!addrLower) return null;
@@ -289,6 +312,14 @@ const RyzeEngine = (() => {
   function dayOf(x) {
     return (x.timestamp || '').slice(0, 10);
   }
+  // UTC hour bucket of a transfer ('2026-04-12T09:00'), for tx-time pricing.
+  function hourOf(x) {
+    const t = x.timestamp || '';
+    return t.length >= 13 ? t.slice(0, 13) + ':00' : null;
+  }
+  const hourKey = (ms) => new Date(ms).toISOString().slice(0, 13) + ':00';
+  const hourMs = (hk) =>
+    Date.UTC(+hk.slice(0, 4), +hk.slice(5, 7) - 1, +hk.slice(8, 10), +hk.slice(11, 13));
 
   const _txCache = new Map();
   async function txTransfers(txHash) {
@@ -350,28 +381,82 @@ const RyzeEngine = (() => {
     });
   }
 
-  // Kraken daily closes, primary price source (matches reference engine).
-  async function fetchKrakenDaily(pair, start, end) {
+  // Kraken hourly closes for the live price tail. History comes from the
+  // bundled data/kraken-hourly.json (refreshed daily by CI), so the engine
+  // only fetches the trailing hours — the part Kraken still revises.
+  // Deep hourly history comes from Coinbase Exchange: Kraken's public OHLC
+  // only serves the newest ~720 hourly candles, while Coinbase pages by
+  // explicit start/end (300 candles/request). Response: [time, low, high,
+  // open, close, volume], newest-first.
+  async function fetchCoinbaseHourly(product, fromHour, toHour) {
     const out = {};
-    const startMs = Date.UTC(
-      +start.slice(0, 4), +start.slice(5, 7) - 1, +start.slice(8, 10)
-    );
-    const endMs = Date.UTC(+end.slice(0, 4), +end.slice(5, 7) - 1, +end.slice(8, 10));
-    for (let dt = startMs; dt <= endMs; dt += 60 * 86400 * 1000) {
-      const since = Math.floor(dt / 1000);
+    let endMs = hourMs(toHour) + 3600000;
+    const fromMs = hourMs(fromHour);
+    while (endMs > fromMs) {
+      const startMs = Math.max(fromMs, endMs - 300 * 3600000);
       const d = await fetchJSON(
-        `${KRAKEN}?pair=${pair}&interval=1440&since=${since}`,
+        `https://api.exchange.coinbase.com/products/${product}/candles` +
+          `?granularity=3600&start=${encodeURIComponent(new Date(startMs).toISOString())}` +
+          `&end=${encodeURIComponent(new Date(endMs).toISOString())}`,
         { tries: 4 }
       );
-      if (d.error && d.error.length) throw new Error('Kraken: ' + d.error.join('; '));
-      const key = Object.keys(d.result || {})[0];
-      for (const c of d.result[key] || []) {
-        const day = new Date(c[0] * 1000).toISOString().slice(0, 10);
-        if (day >= start && day <= end && !(day in out)) out[day] = parseFloat(c[4]);
+      for (const c of d || []) {
+        const hk = hourKey(c[0] * 1000);
+        if (hk >= fromHour && hk <= toHour && !(hk in out)) out[hk] = parseFloat(c[4]);
       }
+      if (!d || !d.length) break;
+      endMs = startMs;
       await sleep(400);
     }
     return out;
+  }
+
+  // Kraken's recent serve window (~720 hourly candles) in one request.
+  // fromHour must be within 700h of toHour — callers split the range.
+  async function fetchKrakenRecent(pair, fromHour, toHour) {
+    const d = await fetchJSON(
+      `${KRAKEN}?pair=${pair}&interval=60&since=${Math.floor(hourMs(fromHour) / 1000)}`,
+      { tries: 4 }
+    );
+    if (d.error && d.error.length) throw new Error('Kraken: ' + d.error.join('; '));
+    const out = {};
+    const key = Object.keys(d.result || {})[0];
+    for (const c of d.result[key] || []) {
+      const hk = hourKey(c[0] * 1000);
+      if (hk >= fromHour && hk <= toHour && !(hk in out)) out[hk] = parseFloat(c[4]);
+    }
+    return out;
+  }
+
+  // Full-range hourly closes: Coinbase for the deep history Kraken won't
+  // serve, Kraken for the recent tail (the engine's primary source wins
+  // any overlap).
+  async function fetchPriceRange(pair, coinbaseProduct, fromHour, toHour) {
+    const splitHour = hourKey(Math.max(hourMs(toHour) - 700 * 3600000, hourMs(fromHour)));
+    const out = {};
+    if (hourMs(fromHour) < hourMs(splitHour))
+      Object.assign(out, await fetchCoinbaseHourly(coinbaseProduct, fromHour, splitHour));
+    Object.assign(out, await fetchKrakenRecent(pair, splitHour, toHour));
+    return out;
+  }
+
+  // Bundled hourly closes (data/kraken-hourly.json, refreshed daily by CI).
+  // Node reads from the repo checkout; the browser fetches it same-origin.
+  async function loadBundledPrices() {
+    try {
+      if (typeof process !== 'undefined' && process.versions && process.versions.node) {
+        const fs = require('fs');
+        const path = require('path');
+        return JSON.parse(
+          fs.readFileSync(path.join(__dirname, '..', 'data', 'kraken-hourly.json'), 'utf8')
+        );
+      }
+      const r = await fetch('data/kraken-hourly.json');
+      if (!r.ok) return null;
+      return await r.json();
+    } catch (e) {
+      return null;
+    }
   }
 
   // Coinbase Exchange daily candles — fallback if Kraken is unreachable.
@@ -399,10 +484,28 @@ const RyzeEngine = (() => {
   }
 
   async function fetchPrices(pair, coinbaseProduct, start, end, onProgress) {
+    const key = pair.startsWith('ETH') ? 'ETH' : 'BTC';
+    const startHour = start + 'T00:00';
+    const endHour = end + 'T23:00';
+    let stored = null;
+    try {
+      const bundled = await loadBundledPrices();
+      if (bundled && bundled[key]) stored = bundled[key];
+    } catch (e) { /* live fetch is the fallback */ }
+    const map = {};
+    if (stored) {
+      for (const h in stored) if (h >= startHour && h <= endHour) map[h] = stored[h];
+    }
+    // Refresh the trailing 30 hours live (Kraken revises the newest candles).
+    const tailStart = hourKey(Math.max(hourMs(endHour) - 29 * 3600000, hourMs(startHour)));
     try {
       if (onProgress) onProgress(`prices:${pair}`, 'kraken');
-      return { src: 'Kraken', map: await fetchKrakenDaily(pair, start, end) };
+      const live = await fetchPriceRange(pair, coinbaseProduct, stored ? tailStart : startHour, endHour);
+      for (const h in live) map[h] = live[h]; // live wins on the tail
+      if (!Object.keys(map).length) throw new Error('no prices');
+      return { src: 'Kraken', map };
     } catch (e) {
+      if (Object.keys(map).length) return { src: 'Kraken', map };
       if (onProgress) onProgress(`prices:${pair}`, 'coinbase-fallback');
       return { src: 'Coinbase Exchange', map: await fetchCoinbaseDaily(coinbaseProduct, start, end) };
     }
@@ -617,12 +720,14 @@ const RyzeEngine = (() => {
         }
         if (pool) {
           const ts = byTx.get(h).map((t) => dayOf(t)).sort()[0];
+          const hr =
+            byTx.get(h).map((t) => hourOf(t)).filter(Boolean).sort()[0] || null;
           const net = {};
           for (const k of TOKENS) {
             const v = Math.round((inputs[k] - dust[k]) * 1e4) / 1e4;
             if (v > 0) net[k] = v;
           }
-          deposits.push({ date: ts, pool, net, tx: h });
+          deposits.push({ date: ts, hour: hr, pool, net, tx: h });
         }
       },
       onProgress
@@ -681,6 +786,12 @@ const RyzeEngine = (() => {
         for (const y of items) {
           const fr = addrOf(y.from);
           if (addrOf(y.to) === ZERO && !TOKENS.includes(sym(y))) {
+            // Genuine withdrawal = burn of a Ryze pool LP token, by the
+            // wallet (migration-style), a gauge, a pool, or a helper.
+            // Unrelated DeFi burns (Beefy/Aerodrome/Maverick vault exits,
+            // even when the wallet burns them itself) are not withdrawals.
+            if (fr !== w && !RYZE_BURNERS.has(fr)) continue;
+            if (!LP_SYMS.has(sym(y))) continue;
             sawBurn = true;
             if (!burnPool) burnPool = poolOf(fr);
           }
@@ -705,12 +816,14 @@ const RyzeEngine = (() => {
         if (!pool) pool = out.CBBTC > 0 ? 'B' : out.WETH > 0 ? 'W' : null;
         if (!pool) return;
         const ts = byTx.get(h).map((t) => dayOf(t)).sort()[0];
+        const hr =
+          byTx.get(h).map((t) => hourOf(t)).filter(Boolean).sort()[0] || null;
         const net = {};
         for (const k of TOKENS) {
           const v = Math.round(out[k] * 1e4) / 1e4;
           if (v > 0) net[k] = v;
         }
-        withdrawals.push({ date: ts, pool, net, tx: h });
+        withdrawals.push({ date: ts, hour: hr, pool, net, tx: h });
       },
       onProgress
     );
@@ -797,17 +910,18 @@ const RyzeEngine = (() => {
   function buildSeries(events, flows, prices, start, end) {
     // events: [[date, pool, du, dw, db]] ; flows: [{date, pool, net, sign}]
     const ev = {};
-    const add = (date, pool, du, de, db) => {
+    const add = (date, pool, du, de, db, hour) => {
       if (!ev[date]) ev[date] = [];
-      ev[date].push([pool, du, de, db]);
+      ev[date].push([pool, du, de, db, hour]);
     };
     for (const [date, pool, du, de, db] of events) add(date, pool, du, de, db);
     for (const f of flows) {
-      add(f.date, f.pool, f.net.USDC || 0, f.net.WETH || 0, f.net.CBBTC || 0);
+      add(f.date, f.pool, f.net.USDC || 0, f.net.WETH || 0, f.net.CBBTC || 0, f.hour);
     }
     const ETH = prices.ETH.map, BTC = prices.BTC.map;
-    // Nearest-earlier close for a date (crypto trades 24/7 so every day
-    // should be present; this is just insurance against a gap in the feed).
+    // Nearest-earlier close for an hour key (crypto trades 24/7 so every
+    // hour should be present; this is just insurance against a gap in the
+    // feed). Works unchanged for day-keyed fallback maps.
     const sortedKeys = (map) => Object.keys(map).sort();
     const ethKeys = sortedKeys(ETH), btcKeys = sortedKeys(BTC);
     const closeAt = (map, keys, date) => {
@@ -819,6 +933,23 @@ const RyzeEngine = (() => {
         else hi = mid;
       }
       return lo > 0 ? map[keys[lo - 1]] : 0;
+    };
+    // Per-pool active windows: each pool is measured over its own life
+    // (first deposit -> end), so a pool that started later never displays
+    // the other pool's start date in its math. The blended figure keeps
+    // the global window.
+    const poolStart = { W: null, B: null };
+    for (const f of flows) {
+      if (
+        (f.pool === 'W' || f.pool === 'B') &&
+        (!poolStart[f.pool] || f.date < poolStart[f.pool])
+      ) {
+        poolStart[f.pool] = f.date;
+      }
+    }
+    const poolDays = {
+      W: poolStart.W ? dayDiff(poolStart.W, end) + 1 : 0,
+      B: poolStart.B ? dayDiff(poolStart.B, end) + 1 : 0,
     };
     // Gross committed per pool + per-deposit detail for the "how is this
     // calculated" breakdown. Each positive flow is valued at the close on
@@ -842,7 +973,7 @@ const RyzeEngine = (() => {
               : closeAt(
                   t === 'WETH' ? ETH : BTC,
                   t === 'WETH' ? ethKeys : btcKeys,
-                  f.date
+                  f.hour || f.date
                 );
           const c = r4(a * px);
           costs[t] = { amt: r4(a), cost: c };
@@ -881,15 +1012,24 @@ const RyzeEngine = (() => {
     const endMs = Date.UTC(+end.slice(0, 4), +end.slice(5, 7) - 1, +end.slice(8, 10));
     for (; dms <= endMs; dms += 86400000) {
       const s = new Date(dms).toISOString().slice(0, 10);
-      PX.WETH = closeAt(ETH, ethKeys, s);
-      PX.CBBTC = closeAt(BTC, btcKeys, s);
-      for (const [pool, du, de, db] of ev[s] || []) {
+      // End-of-day hourly closes drive the principal series; PX still holds
+      // the end date's prices after the loop (used for current value).
+      PX.WETH = closeAt(ETH, ethKeys, s + 'T23:00');
+      PX.CBBTC = closeAt(BTC, btcKeys, s + 'T23:00');
+      for (const [pool, du, de, db, hr] of ev[s] || []) {
         const amts = { USDC: du, WETH: de, CBBTC: db };
+        // Cost-basis lots are valued at the transaction's hour.
+        const at = hr || s + 'T23:00';
+        const px = {
+          USDC: 1,
+          WETH: closeAt(ETH, ethKeys, at),
+          CBBTC: closeAt(BTC, btcKeys, at),
+        };
         for (const t of TOKENS) {
           const a = amts[t];
           if (a > 0) {
             // Deposit: push a cost-basis lot.
-            lots[pool][t].push({ amt: a, cost: r4(a * PX[t]) });
+            lots[pool][t].push({ amt: a, cost: r4(a * px[t]) });
           } else if (a < 0) {
             // Withdrawal: consume oldest lots first at their cost.
             // Principal can never go negative: a withdrawal can only return
@@ -914,9 +1054,11 @@ const RyzeEngine = (() => {
       tw.B += principalOf('B');
       n++;
     }
-    // Per-deposit TWAP contributions, now that the window day-count is known.
+    // Per-deposit TWAP contributions, weighted within each pool's own
+    // active window (global window as a fallback, should it be missing).
     for (const d of depositDetail) {
-      d.contrib = r4((d.total * d.daysActive) / n);
+      const pd = poolDays[d.pool] > 0 ? poolDays[d.pool] : n;
+      d.contrib = r4((d.total * d.daysActive) / pd);
     }
     // Current market value of what's still in the pool: remaining lot
     // amounts valued at the end-day close (PX holds the end date's prices
@@ -931,6 +1073,12 @@ const RyzeEngine = (() => {
       );
     return {
       twap: { W: tw.W / n, B: tw.B / n },
+      twapOwn: {
+        W: poolDays.W > 0 ? tw.W / poolDays.W : 0,
+        B: poolDays.B > 0 ? tw.B / poolDays.B : 0,
+      },
+      poolDays,
+      poolStart,
       days: n,
       endBal: { W: principalOf('W'), B: principalOf('B') },
       curVal: { W: curVal('W'), B: curVal('B') },
@@ -1043,7 +1191,7 @@ const RyzeEngine = (() => {
         },
       })),
     ];
-    const { twap, days, endBal, curVal, gross, depositDetail } = buildSeries(
+    const { twap, twapOwn, poolDays, poolStart, days, endBal, curVal, gross, depositDetail } = buildSeries(
       genesis,
       flows,
       prices,
@@ -1066,14 +1214,20 @@ const RyzeEngine = (() => {
       const claimed = claims.filter((c) => c.pool === q).reduce((s, c) => s + c.amount, 0);
       const nClaims = claims.filter((c) => c.pool === q).length;
       const rewards = claimed + (unclaimedOk ? unclaimed[q] : 0);
-      const t = twap[q];
-      const apr = t > 0 ? (rewards / t) * (365 / days) : 0;
+      // Per-pool window: capital at work is time-weighted over the pool's
+      // own active life (first deposit -> end). APR is unchanged by this:
+      // rewards/(tw/pd)*(365/pd) == rewards*365/tw for any pd.
+      const pd = poolDays[q] > 0 ? poolDays[q] : days;
+      const t = twapOwn[q];
+      const apr = t > 0 ? (rewards / t) * (365 / pd) : 0;
       const estCurVal = curVal[q];
       const lv = (live && live[q]) || { usd: 0, ok: false };
       pools[q] = {
         name: POOL_NAMES[q],
         rewards,
         twap: t,
+        poolDays: pd,
+        poolStart: poolStart[q],
         gross: gross[q],
         calc: depositDetail.filter((d) => d.pool === q),
         calcExact: wdByPool[q] === 0,
@@ -1088,7 +1242,7 @@ const RyzeEngine = (() => {
         principalKnown: t > 0,
       };
     }
-    const bTwap = pools.W.twap + pools.B.twap;
+    const bTwap = twap.W + twap.B; // global window: unchanged by the per-pool display
     const bRew = pools.W.rewards + pools.B.rewards;
     const bApr = bTwap > 0 ? (bRew / bTwap) * (365 / days) : 0;
     const blended = {
