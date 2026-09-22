@@ -42,7 +42,7 @@ function wrap({ subject, preheader, bodyHtml, unsubUrl }) {
 <tr><td style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#16202e;">
 ${bodyHtml}
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td style="padding:18px 4px 0;font-size:12px;line-height:1.6;color:#8a97a8;">
-Ryze LP weekly digest &middot; computed from public on-chain data (Blockscout, Kraken daily closes, Base RPC). Historical performance does not predict future returns. Not financial advice.
+Ryze LP weekly digest &middot; computed from public on-chain data (Blockscout, Kraken hourly closes, Base RPC). Historical performance does not predict future returns. Not financial advice.
 ${unsubUrl ? `<br><a href="${esc(unsubUrl)}" style="color:#8a97a8;">Unsubscribe</a>` : ''}
 </td></tr></table>
 </td></tr>
@@ -116,13 +116,14 @@ function calcBlock(r) {
     const p = r.pools[q];
     if (!p.calc || !p.calc.length) return '';
     const lines = p.calc.map((d) =>
-      `<tr><td style="padding:2px 0;font-size:12px;color:#5b6b80;">${money(d.total)} on ${prettyDate(d.date)} &times; ${d.daysActive}/${r.days} days</td><td align="right" style="padding:2px 0;font-size:12px;font-weight:600;">${money(d.contrib)}</td></tr>`
+      `<tr><td style="padding:2px 0;font-size:12px;color:#5b6b80;">${money(d.total)} on ${prettyDate(d.date)} &times; ${d.daysActive}/${p.poolDays} days</td><td align="right" style="padding:2px 0;font-size:12px;font-weight:600;">${money(d.contrib)}</td></tr>`
     ).join('');
     const note = p.calcExact
       ? `Adds up to the ${money(p.twap)} capital at work. APR divides rewards by capital at work, not by total cost basis &mdash; money only counts for the days it was in the pool.`
       : `This pool has withdrawals, so its capital-at-work figure reflects FIFO lot accounting &mdash; deposits show what went in and when.`;
     return `<div style="font-size:13px;font-weight:700;margin:10px 0 2px;">${esc(p.name)}</div>` +
       `<div style="font-size:12px;color:#5b6b80;">Total cost basis <b style="color:#16202e;">${money(p.gross)}</b> &rarr; capital at work <b style="color:#16202e;">${money(p.twap)}</b></div>` +
+      (p.poolStart ? `<div style="font-size:11px;color:#8a97a8;">Measured ${prettyDate(p.poolStart)} &rarr; ${prettyDate(r.end)} (${p.poolDays} days)</div>` : '') +
       `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:4px;">${lines}</table>` +
       `<div style="font-size:11px;color:#8a97a8;margin-top:2px;">${note}</div>`;
   }).filter(Boolean).join('');
@@ -147,7 +148,7 @@ function metaLine(r) {
   return `${warn}
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td style="background:#ffffff;border:1px solid #e3e9f0;border-radius:14px;padding:14px 16px;">
 <div style="font-size:13px;color:#5b6b80;line-height:2;">${bits.join(' &nbsp;&middot;&nbsp; ')}</div>
-<div style="font-size:12px;color:#8a97a8;margin-top:8px;line-height:1.6;">Total cost basis is the actual amount that went in, before the protocol converted it into the pool position &mdash; the purest comparable figure, since Ryze pools aren't 50/50 and the converted split differs with every deposit. Capital at work is the time-weighted capital the APR is figured on &mdash; a deposit made later in the window counts for fewer days, which is why it can read lower than total cost basis. (Converting the deposit into the pool position also costs a small amount in swap fees &mdash; typically a few dollars per deposit.) Market moves never change either number, so the APR is pure yield, not price appreciation. Current value is read live from each pool's staking gauge (getStake) and priced from the pool's reserves &mdash; the exact position right now. If the live read fails, it falls back to valuing remaining deposits at today's closes, marked (est.). The gap between current value and capital at work is market gain or loss.</div>
+<div style="font-size:12px;color:#8a97a8;margin-top:8px;line-height:1.6;">Total cost basis is the actual amount that went in, before the protocol converted it into the pool position &mdash; the purest comparable figure, since Ryze pools aren't 50/50 and the converted split differs with every deposit. Capital at work is the time-weighted capital the APR is figured on &mdash; a deposit made later in the window counts for fewer days, which is why it can read lower than total cost basis. Each pool is measured over its own active window (first deposit to today); blended figures use the full window across both pools. (Converting the deposit into the pool position also costs a small amount in swap fees &mdash; typically a few dollars per deposit.) Market moves never change either number, so the APR is pure yield, not price appreciation. Current value is read live from each pool's staking gauge (getStake) and priced from the pool's reserves &mdash; the exact position right now. If the live read fails, it falls back to valuing remaining deposits at today's closes, marked (est.). The gap between current value and capital at work is market gain or loss.</div>
 ${calcBlock(r)}
 ${priceNote}
 </td></tr></table>`;
@@ -173,7 +174,7 @@ function fullEmail(r, ctx) {
   const calcText = (p) => {
     if (!p.calc || !p.calc.length) return '';
     const lines = p.calc.map((d) =>
-      `  ${money(d.total)} on ${d.date} x ${d.daysActive}/${r.days} days = ${money(d.contrib)}`
+      `  ${money(d.total)} on ${d.date} x ${d.daysActive}/${p.poolDays} days = ${money(d.contrib)}`
     ).join('\n');
     return `\n  How calculated (${p.name}):\n${lines}\n  -> capital at work ${money(p.twap)}${p.calcExact ? '' : ' (FIFO, has withdrawals)'}`;
   };
