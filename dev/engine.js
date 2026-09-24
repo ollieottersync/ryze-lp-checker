@@ -19,9 +19,13 @@
  *      underlying (USDC/WETH/cbBTC) is returned to the wallet in the same
  *      tx. The burn separates withdrawals from plain reward payouts.
  *   3b. Migrations = a withdrawal matched against same-pool deposits in
- *      the following 2 days (e.g. a pool migration: withdraw from the old pool,
- *      re-deposit into the new one). The pair nets to its capital delta so the
- *      re-deposit is not counted as brand-new principal.
+ *      the following 2 days, ONLY when the burned LP token contract differs
+ *      from the deposited LP token contract (genuine old-pool -> new-pool
+ *      migration, e.g. the April 2026 migration). The pair nets to its
+ *      capital delta so the re-deposit is not counted as brand-new
+ *      principal. A same-pool exit + re-entry keeps both flows gross, and
+ *      the breakdown shows withdrawals alongside deposits so the wallet's
+ *      actual transactions always reconcile.
  *   4. Principal series per pool = cumulative cost basis: each deposit /
  *      withdrawal is valued in USD at the close on ITS OWN day (what the LP
  *      actually put in / took out), summed per pool per day and floored at
@@ -186,8 +190,12 @@ const RyzeEngine = (() => {
       /* quota or private mode — caching is best-effort */
     }
   }
-  // Compact transfer tuple: [txHash, logIndex, symbol, value, decimals, from, to, timestamp]
-  // Only the fields the extractors read (sym/amt/addrOf/dayOf/txHash/logIndex).
+  // Compact transfer tuple:
+  // [txHash, logIndex, symbol, value, decimals, from, to, timestamp, tokenContract]
+  // Only the fields the extractors read (sym/amt/addrOf/dayOf/txHash/logIndex,
+  // plus the token contract for LP-identity in migration netting). The 9th
+  // field was added later; older cached tuples have 8 fields and unpack
+  // tolerantly (tokenContract === ''), so existing caches stay valid.
   function packTransfer(x) {
     return [
       x.transaction_hash || '',
@@ -198,13 +206,14 @@ const RyzeEngine = (() => {
       addrOf(x.from),
       addrOf(x.to),
       x.timestamp || '',
+      x.token && x.token.address ? String(x.token.address).toLowerCase() : '',
     ];
   }
   function unpackTransfer(t) {
     return {
       transaction_hash: t[0],
       log_index: t[1],
-      token: { symbol: t[2], decimals: t[4] },
+      token: { symbol: t[2], decimals: t[4], address: t[8] || '' },
       total: { value: t[3] },
       from: { hash: t[5] },
       to: { hash: t[6] },
@@ -308,6 +317,14 @@ const RyzeEngine = (() => {
   }
   function addrOf(part) {
     return ((part && part.hash) || '').toLowerCase();
+  }
+  // Token contract address of a transfer (lowercased; '' when unknown, e.g.
+  // tuples cached before the 9th field existed). Used for LP-token identity
+  // in migration netting — each Ryze pool contract is its own LP token, so
+  // the contract tells an old-pool LP apart from a new-pool LP even when
+  // both carry the same symbol.
+  function tokenAddr(x) {
+    return ((x.token && x.token.address) || '').toLowerCase();
   }
   function dayOf(x) {
     return (x.timestamp || '').slice(0, 10);
@@ -699,6 +716,8 @@ const RyzeEngine = (() => {
       async (h) => {
         const items = await txTransfers(h);
         let pool = null;
+        let lpToken = ''; // LP token contract of this deposit
+        let lpTo = ''; // where the LP tokens went (gauge), for old-cache fallback
         const inputs = { USDC: 0, WETH: 0, CBBTC: 0 };
         const dust = { USDC: 0, WETH: 0, CBBTC: 0 };
         for (const y of items) {
@@ -709,7 +728,15 @@ const RyzeEngine = (() => {
           // LP token deposited into a pool? (plain USDC/WETH/cbBTC excluded)
           if (!TOKENS.includes(s)) {
             const p = poolOf(to);
-            if (p) pool = p;
+            if (p) {
+              pool = p;
+              // Prefer the transfer whose recipient is a staking gauge —
+              // the LP token contract is the same either way.
+              if (VAULT_SET.has(to) || !lpToken) {
+                lpToken = tokenAddr(y);
+                lpTo = to;
+              }
+            }
           }
           if (fr === w && TOKENS.includes(s)) inputs[s] += a;
           // funds returned to the wallet in the same tx are netted off;
@@ -727,7 +754,7 @@ const RyzeEngine = (() => {
             const v = Math.round((inputs[k] - dust[k]) * 1e4) / 1e4;
             if (v > 0) net[k] = v;
           }
-          deposits.push({ date: ts, hour: hr, pool, net, tx: h });
+          deposits.push({ date: ts, hour: hr, pool, net, tx: h, lpToken, lpTo });
         }
       },
       onProgress
@@ -783,6 +810,8 @@ const RyzeEngine = (() => {
         const items = await txTransfers(h);
         let burnPool = null;
         let sawBurn = false;
+        let burnLp = ''; // burned LP token's contract
+        let burner = ''; // who performed the burn (gauge, pool, helper, or the wallet)
         for (const y of items) {
           const fr = addrOf(y.from);
           if (addrOf(y.to) === ZERO && !TOKENS.includes(sym(y))) {
@@ -793,6 +822,10 @@ const RyzeEngine = (() => {
             if (fr !== w && !RYZE_BURNERS.has(fr)) continue;
             if (!LP_SYMS.has(sym(y))) continue;
             sawBurn = true;
+            if (!burnLp) {
+              burnLp = tokenAddr(y);
+              burner = fr;
+            }
             if (!burnPool) burnPool = poolOf(fr);
           }
         }
@@ -823,7 +856,7 @@ const RyzeEngine = (() => {
           const v = Math.round(out[k] * 1e4) / 1e4;
           if (v > 0) net[k] = v;
         }
-        withdrawals.push({ date: ts, hour: hr, pool, net, tx: h });
+        withdrawals.push({ date: ts, hour: hr, pool, net, tx: h, lpToken: burnLp, burner });
       },
       onProgress
     );
@@ -839,9 +872,16 @@ const RyzeEngine = (() => {
   // withdrawal against same-pool deposits in the following
   // MIGRATION_WINDOW_DAYS days and net them: the deposit keeps only the
   // net-new capital (it may go slightly negative = a net outflow), and a
-  // fully-absorbed withdrawal is dropped. Coincidental withdraw+deposit
-  // pairs are harmless here — netting only re-times the net flow by at
-  // most the window length, which barely moves a time-weighted average.
+  // fully-absorbed withdrawal is dropped.
+  //
+  // Netting applies ONLY to genuine migrations: the burned LP token
+  // contract must differ from the deposited LP token contract (old pool
+  // -> new pool). A same-pool exit + re-entry (withdraw 100%, come back
+  // days later with fresh capital) keeps both flows gross — netting those
+  // fabricates a deposit amount the wallet never made and hides the exit.
+  // The netting is APR-neutral either way (~0.2% TWAP movement); this is
+  // purely about reconciliation: what the breakdown shows must match the
+  // wallet's actual transactions.
   const MIGRATION_WINDOW_DAYS = 2;
   const r4 = (n) => Math.round(n * 1e4) / 1e4;
   function dayDiff(a, b) {
@@ -849,18 +889,41 @@ const RyzeEngine = (() => {
     const msB = Date.UTC(+b.slice(0, 4), +b.slice(5, 7) - 1, +b.slice(8, 10));
     return (msB - msA) / 86400000;
   }
+  // Is this withdrawal/deposit pair a genuine pool migration? Primary
+  // signal: the LP token contracts differ (old pool LP burned, new pool LP
+  // minted — each pool contract is its own LP token, so the contract tells
+  // them apart even when the symbols match). Fallback for transfers cached
+  // before the token-contract field existed: compare who burned the LP
+  // against where the new LP went — an old-gauge/old-pool/self burn paired
+  // with a new-gauge deposit is a migration; a burn by the same gauge the
+  // re-deposit went to is an exit + re-entry. The fallback is strictly
+  // narrower than the old always-net behavior.
+  function isGenuineMigration(wd, d) {
+    const wLp = (wd.lpToken || '').toLowerCase();
+    const dLp = (d.lpToken || '').toLowerCase();
+    if (wLp && dLp) return wLp !== dLp;
+    const burner = (wd.burner || '').toLowerCase();
+    const depTo = (d.lpTo || '').toLowerCase();
+    return !!(burner && depTo && burner !== depTo);
+  }
   function netMigrations(deposits, withdrawals) {
     const dps = deposits.map((d) => ({
       date: d.date,
       pool: d.pool,
       tx: d.tx,
+      lpToken: d.lpToken || '',
+      lpTo: d.lpTo || '',
       net: { USDC: d.net.USDC || 0, WETH: d.net.WETH || 0, CBBTC: d.net.CBBTC || 0 },
-      migration: false,
+      migration: null, // { fromTx, fromDate, netted: {USDC,WETH,CBBTC} } when netted
     }));
     const wds = withdrawals.map((w) => ({
       date: w.date,
       pool: w.pool,
       tx: w.tx,
+      hour: w.hour || null,
+      lpToken: w.lpToken || '',
+      burner: w.burner || '',
+      gross: { USDC: w.net.USDC || 0, WETH: w.net.WETH || 0, CBBTC: w.net.CBBTC || 0 },
       remaining: { USDC: w.net.USDC || 0, WETH: w.net.WETH || 0, CBBTC: w.net.CBBTC || 0 },
       absorbed: false,
     }));
@@ -872,6 +935,9 @@ const RyzeEngine = (() => {
         if (d.pool !== wd.pool) continue;
         const diff = dayDiff(wd.date, d.date);
         if (diff < 0 || diff > MIGRATION_WINDOW_DAYS) continue;
+        // Same-LP exit + re-entry must never net — only a genuine
+        // old-pool -> new-pool migration collapses to its capital delta.
+        if (!isGenuineMigration(wd, d)) continue;
         let touched = false;
         for (const t of TOKENS) {
           const take = Math.min(d.net[t], wd.remaining[t]);
@@ -879,10 +945,12 @@ const RyzeEngine = (() => {
             d.net[t] = r4(d.net[t] - take);
             wd.remaining[t] = r4(wd.remaining[t] - take);
             touched = true;
+            if (!d.migration)
+              d.migration = { fromTx: wd.tx, fromDate: wd.date, netted: { USDC: 0, WETH: 0, CBBTC: 0 } };
+            d.migration.netted[t] = r4(d.migration.netted[t] + take);
           }
         }
         if (touched) {
-          d.migration = true;
           if (!wd.absorbed) {
             wd.absorbed = true;
             migrations++;
@@ -897,17 +965,28 @@ const RyzeEngine = (() => {
     });
     // An absorbed withdrawal keeps any unabsorbed remainder (a partial
     // re-deposit is still a net outflow); only fully-absorbed ones drop out.
+    // `gross` is kept for the breakdown so a migration-netted withdrawal can
+    // still be shown at its actual amount with a note.
     const keptWithdrawals = wds
       .filter((wd) => Object.values(wd.remaining).some((v) => v > 0))
       .map((wd) => {
         const net = {};
         for (const t of TOKENS) if (wd.remaining[t] > 0) net[t] = wd.remaining[t];
-        return { date: wd.date, pool: wd.pool, tx: wd.tx, net };
+        const gross = {};
+        for (const t of TOKENS) if (wd.gross[t] > 0) gross[t] = wd.gross[t];
+        return { date: wd.date, pool: wd.pool, tx: wd.tx, net, gross };
       });
-    return { deposits: keptDeposits, withdrawals: keptWithdrawals, migrations };
+    // Full pre-netting withdrawal ledger for the breakdown: every genuine
+    // outflow the wallet made, flagged when a migration absorbed it.
+    const withdrawalLedger = wds.map((wd) => {
+      const gross = {};
+      for (const t of TOKENS) if (wd.gross[t] > 0) gross[t] = wd.gross[t];
+      return { date: wd.date, pool: wd.pool, tx: wd.tx, hour: wd.hour, gross, absorbed: wd.absorbed };
+    });
+    return { deposits: keptDeposits, withdrawals: keptWithdrawals, migrations, withdrawalLedger };
   }
 
-  function buildSeries(events, flows, prices, start, end) {
+  function buildSeries(events, flows, prices, start, end, withdrawalLedger = []) {
     // events: [[date, pool, du, dw, db]] ; flows: [{date, pool, net, sign}]
     const ev = {};
     const add = (date, pool, du, de, db, hour) => {
@@ -982,12 +1061,78 @@ const RyzeEngine = (() => {
       }
       if (total > 0) {
         gross[f.pool] = r4(gross[f.pool] + total);
-        depositDetail.push({
+        const entry = {
           date: f.date,
           pool: f.pool,
           costs,
           total,
           daysActive: dayDiff(f.date, end) + 1,
+        };
+        // When a genuine migration netted part of this deposit away, keep
+        // the gross figure and the netted-off amounts for the breakdown so
+        // the user sees what they actually deposited plus a "migration
+        // netting applied" note — instead of a silently replaced amount.
+        // The TWAP math below still uses the netted `total`.
+        const mig = f.migration;
+        if (mig && mig.netted) {
+          const nc = {};
+          let nt = 0;
+          for (const t of TOKENS) {
+            const a = mig.netted[t] || 0;
+            if (a > 0) {
+              const px =
+                t === 'USDC'
+                  ? 1
+                  : closeAt(
+                      t === 'WETH' ? ETH : BTC,
+                      t === 'WETH' ? ethKeys : btcKeys,
+                      f.hour || f.date
+                    );
+              const c = r4(a * px);
+              nc[t] = { amt: r4(a), cost: c };
+              nt = r4(nt + c);
+            }
+          }
+          if (nt > 0) {
+            entry.grossTotal = r4(total + nt);
+            entry.migrationNetted = { costs: nc, total: nt, fromDate: mig.fromDate };
+          }
+        }
+        depositDetail.push(entry);
+      }
+    }
+    // Withdrawal ledger for the breakdown: every genuine outflow the wallet
+    // made, valued in USD at its own day's close, flagged when a pool
+    // migration absorbed it (its story is then told by the deposit's
+    // migration note above). Previously withdrawals were invisible here —
+    // the breakdown showed deposits only.
+    const withdrawalDetail = [];
+    for (const wl of withdrawalLedger) {
+      const costs = {};
+      let total = 0;
+      for (const t of TOKENS) {
+        const a = wl.gross[t] || 0;
+        if (a > 0) {
+          const px =
+            t === 'USDC'
+              ? 1
+              : closeAt(
+                  t === 'WETH' ? ETH : BTC,
+                  t === 'WETH' ? ethKeys : btcKeys,
+                  wl.hour || wl.date
+                );
+          const c = r4(a * px);
+          costs[t] = { amt: r4(a), cost: c };
+          total = r4(total + c);
+        }
+      }
+      if (total > 0) {
+        withdrawalDetail.push({
+          date: wl.date,
+          pool: wl.pool,
+          costs,
+          total,
+          absorbed: !!wl.absorbed,
         });
       }
     }
@@ -1084,6 +1229,7 @@ const RyzeEngine = (() => {
       curVal: { W: curVal('W'), B: curVal('B') },
       gross,
       depositDetail,
+      withdrawalDetail,
     };
   }
 
@@ -1180,7 +1326,7 @@ const RyzeEngine = (() => {
 
     prog('compute', 0, 2, 'Computing cost basis…');
     const flows = [
-      ...netDeposits.map((d) => ({ date: d.date, pool: d.pool, net: d.net })),
+      ...netDeposits.map((d) => ({ date: d.date, pool: d.pool, net: d.net, migration: d.migration || null })),
       ...withdrawals.map((d) => ({
         date: d.date,
         pool: d.pool,
@@ -1191,12 +1337,13 @@ const RyzeEngine = (() => {
         },
       })),
     ];
-    const { twap, twapOwn, poolDays, poolStart, days, endBal, curVal, gross, depositDetail } = buildSeries(
+    const { twap, twapOwn, poolDays, poolStart, days, endBal, curVal, gross, depositDetail, withdrawalDetail } = buildSeries(
       genesis,
       flows,
       prices,
       firstDay,
-      end
+      end,
+      mig.withdrawalLedger
     );
 
     // Live position read: the gauge's getStake is the exact current value.
@@ -1230,6 +1377,7 @@ const RyzeEngine = (() => {
         poolStart: poolStart[q],
         gross: gross[q],
         calc: depositDetail.filter((d) => d.pool === q),
+        wdCalc: withdrawalDetail.filter((w) => w.pool === q),
         calcExact: wdByPool[q] === 0,
         curVal: lv.ok ? r4(lv.usd) : estCurVal,
         liveValue: lv.ok,
