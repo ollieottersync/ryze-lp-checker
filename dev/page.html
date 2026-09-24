@@ -27,6 +27,22 @@
     border-radius:10px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--ink);
     background:#fbfcfe;min-width:0}
   input[type=text]:focus{outline:2px solid var(--accent);border-color:var(--accent)}
+  .addrwrap{flex:1 1 280px;position:relative}
+  .addrwrap input[type=text]{width:100%;flex:none;box-sizing:border-box;margin:0}
+  .recent{display:none;position:absolute;top:calc(100% + 6px);left:0;right:0;z-index:20;
+    background:var(--card);border:1px solid var(--line);border-radius:10px;
+    box-shadow:0 8px 24px rgba(15,40,60,.14);overflow:hidden}
+  .recent.on{display:block}
+  .recent-h{font-size:0.72rem;text-transform:uppercase;letter-spacing:.07em;
+    color:var(--muted);padding:8px 12px 4px}
+  .recent-item{display:block;width:100%;text-align:left;background:none;border:0;
+    padding:9px 12px;font-family:ui-monospace,Menlo,Consolas,monospace;
+    font-size:0.82rem;font-weight:400;color:var(--ink);cursor:pointer;border-radius:0}
+  .recent-item:hover{background:#eef4f1;color:var(--ink)}
+  .recent-f{display:flex;justify-content:space-between;align-items:center;
+    padding:7px 12px;font-size:0.74rem;color:var(--muted);border-top:1px solid var(--line)}
+  .recent-clear{background:none;border:0;color:var(--accent);font-size:0.74rem;
+    cursor:pointer;padding:0;font-weight:600;white-space:nowrap}
   button{padding:12px 22px;font-size:0.95rem;font-weight:700;color:#fff;background:var(--accent);
     border:0;border-radius:10px;cursor:pointer;white-space:nowrap}
   button:hover{background:var(--accent-dark)}
@@ -89,8 +105,11 @@
     <form id="form" autocomplete="off">
       <label for="addr">Base wallet address</label>
       <div class="row">
-        <input type="text" id="addr" name="addr" spellcheck="false"
-               placeholder="0x…">
+        <div class="addrwrap">
+          <input type="text" id="addr" name="addr" spellcheck="false"
+                 placeholder="0x…" autocomplete="off">
+          <div class="recent" id="recent"></div>
+        </div>
         <button type="submit" id="go">Check performance</button>
       </div>
       <p class="hint">Read-only: this page only queries public blockchain and price APIs. It never asks for a wallet connection or signature.</p>
