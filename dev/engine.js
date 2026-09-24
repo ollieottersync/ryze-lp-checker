@@ -1052,7 +1052,11 @@ const RyzeEngine = (() => {
               : closeAt(
                   t === 'WETH' ? ETH : BTC,
                   t === 'WETH' ? ethKeys : btcKeys,
-                  f.hour || f.date
+                  // Same key as the daily principal loop (tx hour, else
+                  // that day's 23:00 close): a bare day key would resolve
+                  // to the PREVIOUS day's close, or to 0 on the first day
+                  // of the price window.
+                  f.hour || f.date + 'T23:00'
                 );
           const c = r4(a * px);
           costs[t] = { amt: r4(a), cost: c };
@@ -1086,7 +1090,7 @@ const RyzeEngine = (() => {
                   : closeAt(
                       t === 'WETH' ? ETH : BTC,
                       t === 'WETH' ? ethKeys : btcKeys,
-                      f.hour || f.date
+                      f.hour || f.date + 'T23:00'
                     );
               const c = r4(a * px);
               nc[t] = { amt: r4(a), cost: c };
@@ -1119,7 +1123,7 @@ const RyzeEngine = (() => {
               : closeAt(
                   t === 'WETH' ? ETH : BTC,
                   t === 'WETH' ? ethKeys : btcKeys,
-                  wl.hour || wl.date
+                  wl.hour || wl.date + 'T23:00'
                 );
           const c = r4(a * px);
           costs[t] = { amt: r4(a), cost: c };
@@ -1153,6 +1157,9 @@ const RyzeEngine = (() => {
       );
     const tw = { W: 0, B: 0 };
     let n = 0;
+    // Per-day FIFO principal per pool — compressed into constant-capital
+    // intervals below, the auditable day-by-day behind "capital at work".
+    const daily = { W: [], B: [] };
     let dms = Date.UTC(+start.slice(0, 4), +start.slice(5, 7) - 1, +start.slice(8, 10));
     const endMs = Date.UTC(+end.slice(0, 4), +end.slice(5, 7) - 1, +end.slice(8, 10));
     for (; dms <= endMs; dms += 86400000) {
@@ -1195,8 +1202,12 @@ const RyzeEngine = (() => {
           }
         }
       }
-      tw.W += principalOf('W');
-      tw.B += principalOf('B');
+      const pW = principalOf('W');
+      const pB = principalOf('B');
+      tw.W += pW;
+      tw.B += pB;
+      daily.W.push([s, pW]);
+      daily.B.push([s, pB]);
       n++;
     }
     // Per-deposit TWAP contributions, weighted within each pool's own
@@ -1205,6 +1216,33 @@ const RyzeEngine = (() => {
       const pd = poolDays[d.pool] > 0 ? poolDays[d.pool] : n;
       d.contrib = r4((d.total * d.daysActive) / pd);
     }
+    // Interval breakdown of capital at work, per pool: consecutive days
+    // with equal FIFO principal collapse into one interval, so each
+    // interval reads as Toolist's table does — net capital × days ÷
+    // poolDays — and the contributions sum exactly to the pool's twap.
+    // Withdrawals are fully accounted for: a withdrawal drops the net
+    // capital for every interval after it. Rendered in the breakdown
+    // whenever a pool has withdrawals (with deposits only, the per-deposit
+    // contribution lines above already tell the same story).
+    function toIntervals(series, pd) {
+      const out = [];
+      let cur = null;
+      for (const [date, cap] of series) {
+        if (!cur || Math.abs(cap - cur.capital) > 0.005) {
+          if (cur) out.push(cur);
+          cur = { start: date, end: date, days: 0, capital: r4(cap), contrib: 0 };
+        }
+        cur.end = date;
+        cur.days += 1;
+      }
+      if (cur) out.push(cur);
+      for (const iv of out) iv.contrib = r4((iv.capital * iv.days) / pd);
+      return out;
+    }
+    const intervals = {
+      W: poolDays.W > 0 ? toIntervals(daily.W, poolDays.W) : [],
+      B: poolDays.B > 0 ? toIntervals(daily.B, poolDays.B) : [],
+    };
     // Current market value of what's still in the pool: remaining lot
     // amounts valued at the end-day close (PX holds the end date's prices
     // after the loop). Shown next to cost basis so the gap between the
@@ -1230,6 +1268,7 @@ const RyzeEngine = (() => {
       gross,
       depositDetail,
       withdrawalDetail,
+      intervals,
     };
   }
 
@@ -1337,7 +1376,7 @@ const RyzeEngine = (() => {
         },
       })),
     ];
-    const { twap, twapOwn, poolDays, poolStart, days, endBal, curVal, gross, depositDetail, withdrawalDetail } = buildSeries(
+    const { twap, twapOwn, poolDays, poolStart, days, endBal, curVal, gross, depositDetail, withdrawalDetail, intervals } = buildSeries(
       genesis,
       flows,
       prices,
@@ -1379,6 +1418,7 @@ const RyzeEngine = (() => {
         calc: depositDetail.filter((d) => d.pool === q),
         wdCalc: withdrawalDetail.filter((w) => w.pool === q),
         calcExact: wdByPool[q] === 0,
+        intervals: intervals[q],
         curVal: lv.ok ? r4(lv.usd) : estCurVal,
         liveValue: lv.ok,
         estCurVal,

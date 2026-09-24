@@ -1287,7 +1287,11 @@ const RyzeEngine = (() => {
               : closeAt(
                   t === 'WETH' ? ETH : BTC,
                   t === 'WETH' ? ethKeys : btcKeys,
-                  f.hour || f.date
+                  // Same key as the daily principal loop (tx hour, else
+                  // that day's 23:00 close): a bare day key would resolve
+                  // to the PREVIOUS day's close, or to 0 on the first day
+                  // of the price window.
+                  f.hour || f.date + 'T23:00'
                 );
           const c = r4(a * px);
           costs[t] = { amt: r4(a), cost: c };
@@ -1321,7 +1325,7 @@ const RyzeEngine = (() => {
                   : closeAt(
                       t === 'WETH' ? ETH : BTC,
                       t === 'WETH' ? ethKeys : btcKeys,
-                      f.hour || f.date
+                      f.hour || f.date + 'T23:00'
                     );
               const c = r4(a * px);
               nc[t] = { amt: r4(a), cost: c };
@@ -1354,7 +1358,7 @@ const RyzeEngine = (() => {
               : closeAt(
                   t === 'WETH' ? ETH : BTC,
                   t === 'WETH' ? ethKeys : btcKeys,
-                  wl.hour || wl.date
+                  wl.hour || wl.date + 'T23:00'
                 );
           const c = r4(a * px);
           costs[t] = { amt: r4(a), cost: c };
@@ -1388,6 +1392,9 @@ const RyzeEngine = (() => {
       );
     const tw = { W: 0, B: 0 };
     let n = 0;
+    // Per-day FIFO principal per pool — compressed into constant-capital
+    // intervals below, the auditable day-by-day behind "capital at work".
+    const daily = { W: [], B: [] };
     let dms = Date.UTC(+start.slice(0, 4), +start.slice(5, 7) - 1, +start.slice(8, 10));
     const endMs = Date.UTC(+end.slice(0, 4), +end.slice(5, 7) - 1, +end.slice(8, 10));
     for (; dms <= endMs; dms += 86400000) {
@@ -1430,8 +1437,12 @@ const RyzeEngine = (() => {
           }
         }
       }
-      tw.W += principalOf('W');
-      tw.B += principalOf('B');
+      const pW = principalOf('W');
+      const pB = principalOf('B');
+      tw.W += pW;
+      tw.B += pB;
+      daily.W.push([s, pW]);
+      daily.B.push([s, pB]);
       n++;
     }
     // Per-deposit TWAP contributions, weighted within each pool's own
@@ -1440,6 +1451,33 @@ const RyzeEngine = (() => {
       const pd = poolDays[d.pool] > 0 ? poolDays[d.pool] : n;
       d.contrib = r4((d.total * d.daysActive) / pd);
     }
+    // Interval breakdown of capital at work, per pool: consecutive days
+    // with equal FIFO principal collapse into one interval, so each
+    // interval reads as Toolist's table does — net capital × days ÷
+    // poolDays — and the contributions sum exactly to the pool's twap.
+    // Withdrawals are fully accounted for: a withdrawal drops the net
+    // capital for every interval after it. Rendered in the breakdown
+    // whenever a pool has withdrawals (with deposits only, the per-deposit
+    // contribution lines above already tell the same story).
+    function toIntervals(series, pd) {
+      const out = [];
+      let cur = null;
+      for (const [date, cap] of series) {
+        if (!cur || Math.abs(cap - cur.capital) > 0.005) {
+          if (cur) out.push(cur);
+          cur = { start: date, end: date, days: 0, capital: r4(cap), contrib: 0 };
+        }
+        cur.end = date;
+        cur.days += 1;
+      }
+      if (cur) out.push(cur);
+      for (const iv of out) iv.contrib = r4((iv.capital * iv.days) / pd);
+      return out;
+    }
+    const intervals = {
+      W: poolDays.W > 0 ? toIntervals(daily.W, poolDays.W) : [],
+      B: poolDays.B > 0 ? toIntervals(daily.B, poolDays.B) : [],
+    };
     // Current market value of what's still in the pool: remaining lot
     // amounts valued at the end-day close (PX holds the end date's prices
     // after the loop). Shown next to cost basis so the gap between the
@@ -1465,6 +1503,7 @@ const RyzeEngine = (() => {
       gross,
       depositDetail,
       withdrawalDetail,
+      intervals,
     };
   }
 
@@ -1572,7 +1611,7 @@ const RyzeEngine = (() => {
         },
       })),
     ];
-    const { twap, twapOwn, poolDays, poolStart, days, endBal, curVal, gross, depositDetail, withdrawalDetail } = buildSeries(
+    const { twap, twapOwn, poolDays, poolStart, days, endBal, curVal, gross, depositDetail, withdrawalDetail, intervals } = buildSeries(
       genesis,
       flows,
       prices,
@@ -1614,6 +1653,7 @@ const RyzeEngine = (() => {
         calc: depositDetail.filter((d) => d.pool === q),
         wdCalc: withdrawalDetail.filter((w) => w.pool === q),
         calcExact: wdByPool[q] === 0,
+        intervals: intervals[q],
         curVal: lv.ok ? r4(lv.usd) : estCurVal,
         liveValue: lv.ok,
         estCurVal,
@@ -1785,6 +1825,10 @@ const RyzeEngine = (() => {
         const hasCalc = p.calc && p.calc.length;
         const hasWd = p.wdCalc && p.wdCalc.length;
         if (!hasCalc && !hasWd) return '';
+        // With withdrawals, per-deposit time-weighting no longer adds up to
+        // capital at work — the interval table below does the math instead,
+        // so deposits render as plain ledger lines here.
+        const hasIntervals = !p.calcExact && p.intervals && p.intervals.length > 0;
         const lines = hasCalc
           ? p.calc
               .map((d) => {
@@ -1798,9 +1842,11 @@ const RyzeEngine = (() => {
                     `matched against the ${prettyDate(mig.fromDate)} withdrawal), ` +
                     `net ${money(d.total)}`
                   : '';
+                const tail = hasIntervals
+                  ? ''
+                  : ` &times; ${d.daysActive}/${r.days} days = <b>${money(d.contrib)}</b>`;
                 return (
-                  `<li>${money(shown)} deposited ${prettyDate(d.date)}${note} &times; ` +
-                  `${d.daysActive}/${r.days} days = <b>${money(d.contrib)}</b></li>`
+                  `<li>${money(shown)} deposited ${prettyDate(d.date)}${note}${tail}</li>`
                 );
               })
               .join('')
@@ -1823,13 +1869,33 @@ const RyzeEngine = (() => {
           ? `Adds up to the ${money(p.twap)} capital at work. The APR divides ` +
             `rewards by capital at work, not by total cost basis &mdash; money only ` +
             `counts for the days it was actually in the pool.`
+          : hasIntervals
+          ? `The day-by-day intervals above add up to the ${money(p.twap)} capital ` +
+            `at work &mdash; each is the net capital in the pool for those days, ` +
+            `so withdrawals are fully accounted for. The APR divides rewards by ` +
+            `capital at work, not by total cost basis.`
           : `This pool has withdrawals, so its capital-at-work figure reflects FIFO lot ` +
             `accounting rather than the simple sum above &mdash; the deposits ` +
             `and withdrawals below show what went in and out and when.`;
+        // Day-by-day net-capital intervals: capital × days ÷ poolDays for
+        // each, summing exactly to capital at work. This is the auditable
+        // form of the FIFO time-weighting — withdrawals drop the net capital
+        // for every interval after them.
+        const ilines = hasIntervals
+          ? `<li style="list-style:none;margin:8px 0 2px"><b>Capital at work, day by day:</b></li>` +
+            p.intervals
+              .map(
+                (iv) =>
+                  `<li>${prettyDate(iv.start)} &ndash; ${prettyDate(iv.end)}: ` +
+                  `${money(iv.capital)} &times; ${iv.days}/${p.poolDays} days = ` +
+                  `<b>${money(iv.contrib)}</b></li>`
+              )
+              .join('')
+          : '';
         return `<h4 style="margin:10px 0 4px;font-size:0.85rem">${esc(p.name)}</h4>` +
           `<p style="margin:0 0 4px">Total cost basis <b>${money(p.gross)}</b> ` +
           `&rarr; capital at work <b>${money(p.twap)}</b></p>` +
-          `<ul style="margin:4px 0;padding-left:20px">${lines}${wlines}</ul>` +
+          `<ul style="margin:4px 0;padding-left:20px">${lines}${wlines}${ilines}</ul>` +
           `<p class="fine" style="margin:4px 0 0">${note}</p>`;
       })
       .filter(Boolean)

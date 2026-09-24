@@ -123,6 +123,10 @@
         const hasCalc = p.calc && p.calc.length;
         const hasWd = p.wdCalc && p.wdCalc.length;
         if (!hasCalc && !hasWd) return '';
+        // With withdrawals, per-deposit time-weighting no longer adds up to
+        // capital at work — the interval table below does the math instead,
+        // so deposits render as plain ledger lines here.
+        const hasIntervals = !p.calcExact && p.intervals && p.intervals.length > 0;
         const lines = hasCalc
           ? p.calc
               .map((d) => {
@@ -136,9 +140,11 @@
                     `matched against the ${prettyDate(mig.fromDate)} withdrawal), ` +
                     `net ${money(d.total)}`
                   : '';
+                const tail = hasIntervals
+                  ? ''
+                  : ` &times; ${d.daysActive}/${r.days} days = <b>${money(d.contrib)}</b>`;
                 return (
-                  `<li>${money(shown)} deposited ${prettyDate(d.date)}${note} &times; ` +
-                  `${d.daysActive}/${r.days} days = <b>${money(d.contrib)}</b></li>`
+                  `<li>${money(shown)} deposited ${prettyDate(d.date)}${note}${tail}</li>`
                 );
               })
               .join('')
@@ -161,13 +167,33 @@
           ? `Adds up to the ${money(p.twap)} capital at work. The APR divides ` +
             `rewards by capital at work, not by total cost basis &mdash; money only ` +
             `counts for the days it was actually in the pool.`
+          : hasIntervals
+          ? `The day-by-day intervals above add up to the ${money(p.twap)} capital ` +
+            `at work &mdash; each is the net capital in the pool for those days, ` +
+            `so withdrawals are fully accounted for. The APR divides rewards by ` +
+            `capital at work, not by total cost basis.`
           : `This pool has withdrawals, so its capital-at-work figure reflects FIFO lot ` +
             `accounting rather than the simple sum above &mdash; the deposits ` +
             `and withdrawals below show what went in and out and when.`;
+        // Day-by-day net-capital intervals: capital × days ÷ poolDays for
+        // each, summing exactly to capital at work. This is the auditable
+        // form of the FIFO time-weighting — withdrawals drop the net capital
+        // for every interval after them.
+        const ilines = hasIntervals
+          ? `<li style="list-style:none;margin:8px 0 2px"><b>Capital at work, day by day:</b></li>` +
+            p.intervals
+              .map(
+                (iv) =>
+                  `<li>${prettyDate(iv.start)} &ndash; ${prettyDate(iv.end)}: ` +
+                  `${money(iv.capital)} &times; ${iv.days}/${p.poolDays} days = ` +
+                  `<b>${money(iv.contrib)}</b></li>`
+              )
+              .join('')
+          : '';
         return `<h4 style="margin:10px 0 4px;font-size:0.85rem">${esc(p.name)}</h4>` +
           `<p style="margin:0 0 4px">Total cost basis <b>${money(p.gross)}</b> ` +
           `&rarr; capital at work <b>${money(p.twap)}</b></p>` +
-          `<ul style="margin:4px 0;padding-left:20px">${lines}${wlines}</ul>` +
+          `<ul style="margin:4px 0;padding-left:20px">${lines}${wlines}${ilines}</ul>` +
           `<p class="fine" style="margin:4px 0 0">${note}</p>`;
       })
       .filter(Boolean)
