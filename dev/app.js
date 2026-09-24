@@ -120,25 +120,54 @@
     const secs = ['W', 'B']
       .map((q) => {
         const p = r.pools[q];
-        if (!p.calc || !p.calc.length) return '';
-        const lines = p.calc
-          .map(
-            (d) =>
-              `<li>${money(d.total)} deposited ${prettyDate(d.date)} &times; ` +
-              `${d.daysActive}/${r.days} days = <b>${money(d.contrib)}</b></li>`
-          )
-          .join('');
+        const hasCalc = p.calc && p.calc.length;
+        const hasWd = p.wdCalc && p.wdCalc.length;
+        if (!hasCalc && !hasWd) return '';
+        const lines = hasCalc
+          ? p.calc
+              .map((d) => {
+                // A genuine pool migration netted part of this deposit away:
+                // show the gross amount the wallet actually deposited plus a
+                // note, instead of the silently netted figure.
+                const mig = d.migrationNetted;
+                const shown = mig && d.grossTotal ? d.grossTotal : d.total;
+                const note = mig
+                  ? ` &mdash; migration netting applied (&minus;${money(mig.total)} ` +
+                    `matched against the ${prettyDate(mig.fromDate)} withdrawal), ` +
+                    `net ${money(d.total)}`
+                  : '';
+                return (
+                  `<li>${money(shown)} deposited ${prettyDate(d.date)}${note} &times; ` +
+                  `${d.daysActive}/${r.days} days = <b>${money(d.contrib)}</b></li>`
+                );
+              })
+              .join('')
+          : '';
+        // Withdrawals the wallet actually made, alongside the deposits —
+        // previously the breakdown showed deposits only.
+        const wlines = hasWd
+          ? p.wdCalc
+              .map(
+                (w) =>
+                  `<li>${money(w.total)} withdrawn ${prettyDate(w.date)}` +
+                  (w.absorbed
+                    ? ` &mdash; pool migration, re-deposited (netted against the deposit above)`
+                    : '') +
+                  `</li>`
+              )
+              .join('')
+          : '';
         const note = p.calcExact
           ? `Adds up to the ${money(p.twap)} capital at work. The APR divides ` +
             `rewards by capital at work, not by total cost basis &mdash; money only ` +
             `counts for the days it was actually in the pool.`
           : `This pool has withdrawals, so its capital-at-work figure reflects FIFO lot ` +
             `accounting rather than the simple sum above &mdash; the deposits ` +
-            `show what went in and when.`;
+            `and withdrawals below show what went in and out and when.`;
         return `<h4 style="margin:10px 0 4px;font-size:0.85rem">${esc(p.name)}</h4>` +
           `<p style="margin:0 0 4px">Total cost basis <b>${money(p.gross)}</b> ` +
           `&rarr; capital at work <b>${money(p.twap)}</b></p>` +
-          `<ul style="margin:4px 0;padding-left:20px">${lines}</ul>` +
+          `<ul style="margin:4px 0;padding-left:20px">${lines}${wlines}</ul>` +
           `<p class="fine" style="margin:4px 0 0">${note}</p>`;
       })
       .filter(Boolean)
