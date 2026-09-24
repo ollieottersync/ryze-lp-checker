@@ -10,6 +10,92 @@
   const pmsg = document.getElementById('pmsg');
   const errEl = document.getElementById('err');
   const resultsEl = document.getElementById('results');
+  const recentEl = document.getElementById('recent');
+
+  // Recent wallet addresses, remembered in this browser only (localStorage —
+  // nothing leaves the page). Valid-format addresses get added on each check.
+  const RECENT_KEY = 'ryzeCheckerRecentWallets';
+  const RECENT_MAX = 8;
+
+  function loadRecent() {
+    try {
+      const v = JSON.parse(localStorage.getItem(RECENT_KEY) || '[]');
+      return Array.isArray(v)
+        ? v.filter((a) => /^0x[0-9a-fA-F]{40}$/.test(a))
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function saveRecent(wallet) {
+    if (!/^0x[0-9a-fA-F]{40}$/.test(wallet)) return;
+    try {
+      const wl = wallet.toLowerCase();
+      const next = [wallet, ...loadRecent().filter((a) => a.toLowerCase() !== wl)]
+        .slice(0, RECENT_MAX);
+      localStorage.setItem(RECENT_KEY, JSON.stringify(next));
+    } catch {
+      /* storage unavailable (private mode) — ignore */
+    }
+  }
+
+  const shortAddr = (a) => a.slice(0, 6) + '…' + a.slice(-4);
+
+  function renderRecent() {
+    const q = addrInput.value.trim().toLowerCase();
+    const items = loadRecent().filter((a) => !q || a.toLowerCase().includes(q));
+    recentEl.innerHTML = '';
+    if (!items.length) {
+      recentEl.classList.remove('on');
+      return;
+    }
+    const h = document.createElement('div');
+    h.className = 'recent-h';
+    h.textContent = 'Recent wallets';
+    recentEl.appendChild(h);
+    for (const a of items) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'recent-item';
+      b.title = a;
+      b.textContent = shortAddr(a);
+      // mousedown (not click) so the fill wins before the input loses focus.
+      b.addEventListener('mousedown', (ev) => {
+        ev.preventDefault();
+        addrInput.value = a;
+        recentEl.classList.remove('on');
+      });
+      recentEl.appendChild(b);
+    }
+    const f = document.createElement('div');
+    f.className = 'recent-f';
+    const note = document.createElement('span');
+    note.textContent = 'Saved in this browser only';
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.className = 'recent-clear';
+    clear.textContent = 'Clear history';
+    clear.addEventListener('mousedown', (ev) => {
+      ev.preventDefault();
+      try { localStorage.removeItem(RECENT_KEY); } catch { /* ignore */ }
+      addrInput.focus();
+      renderRecent();
+    });
+    f.appendChild(note);
+    f.appendChild(clear);
+    recentEl.appendChild(f);
+    recentEl.classList.add('on');
+  }
+
+  addrInput.addEventListener('focus', renderRecent);
+  addrInput.addEventListener('input', renderRecent);
+  addrInput.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') recentEl.classList.remove('on');
+  });
+  document.addEventListener('click', (ev) => {
+    if (!ev.target.closest('.addrwrap')) recentEl.classList.remove('on');
+  });
 
   const money = (n) =>
     n.toLocaleString('en-US', { style: 'currency', currency: 'USD' });
@@ -203,6 +289,8 @@
       showError('That doesn\'t look like a valid Base address — it should be 0x followed by 40 hex characters.');
       return;
     }
+    saveRecent(wallet);
+    recentEl.classList.remove('on');
     goBtn.disabled = true;
     progressEl.classList.add('on');
     barFill.style.width = '0%';
