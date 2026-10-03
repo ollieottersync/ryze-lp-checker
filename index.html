@@ -1507,10 +1507,13 @@ const RyzeEngine = (() => {
     };
   }
 
-  function pacificToday() {
-    return new Date().toLocaleDateString('en-CA', {
-      timeZone: 'America/Los_Angeles',
-    });
+  // Window end is UTC-aligned to match flow dating (dayOf slices the UTC
+  // timestamp): a deposit made at 6pm Pacific lands on "today" UTC, so the
+  // window must too, or same-evening flows sit outside the FIFO lot series
+  // until the Pacific date rolls over. closeAt falls back to the latest
+  // known hourly close, so the partial current UTC day degrades gracefully.
+  function utcToday() {
+    return new Date().toISOString().slice(0, 10);
   }
 
   async function analyze(walletInput, { today = null, onProgress = null } = {}) {
@@ -1520,7 +1523,7 @@ const RyzeEngine = (() => {
     if (!/^0x[0-9a-fA-F]{40}$/.test(wallet)) {
       throw new Error('invalid-address');
     }
-    const end = today || pacificToday();
+    const end = today || utcToday();
 
     prog('transfers', 0, 0, 'Fetching transfer history from Blockscout…');
     const { items: transfers, cached: transfersCached } = await fetchWalletTransfers(wallet, (page, count) =>
