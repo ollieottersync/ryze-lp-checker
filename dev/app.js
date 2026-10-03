@@ -165,13 +165,13 @@
           : '';
         const note = p.calcExact
           ? `Adds up to the ${money(p.twap)} capital at work. The APR divides ` +
-            `rewards by capital at work, not by total cost basis &mdash; money only ` +
+            `rewards by capital at work, not by Total Deposits &mdash; money only ` +
             `counts for the days it was actually in the pool.`
           : hasIntervals
           ? `The day-by-day intervals above add up to the ${money(p.twap)} capital ` +
             `at work &mdash; each is the net capital in the pool for those days, ` +
             `so withdrawals are fully accounted for. The APR divides rewards by ` +
-            `capital at work, not by total cost basis.`
+            `capital at work, not by Total Deposits.`
           : `This pool has withdrawals, so its capital-at-work figure reflects FIFO lot ` +
             `accounting rather than the simple sum above &mdash; the deposits ` +
             `and withdrawals below show what went in and out and when.`;
@@ -191,8 +191,9 @@
               .join('')
           : '';
         return `<h4 style="margin:10px 0 4px;font-size:0.85rem">${esc(p.name)}</h4>` +
-          `<p style="margin:0 0 4px">Total cost basis <b>${money(p.gross)}</b> ` +
-          `&rarr; capital at work <b>${money(p.twap)}</b></p>` +
+          `<p style="margin:0 0 4px">Cost Basis <b>${money(p.fifoPrincipal)}</b> ` +
+          `&middot; Total Deposits <b>${money(p.gross)}</b> &middot; Total Withdrawals ` +
+          `<b>${money(p.totalWithdrawn)}</b> &rarr; capital at work <b>${money(p.twap)}</b></p>` +
           `<ul style="margin:4px 0;padding-left:20px">${lines}${wlines}${ilines}</ul>` +
           `<p class="fine" style="margin:4px 0 0">${note}</p>`;
       })
@@ -204,12 +205,18 @@
         <summary>See how this is calculated</summary>
         <div style="padding:2px 14px 12px;font-size:0.82rem">
           ${secs}
-          <p class="fine" style="margin:10px 0 0">Total cost basis is the actual amount ` +
-      `that went in, before the protocol converted it into the pool position &mdash; ` +
-      `the purest comparable figure, since Ryze pools aren't 50/50 and the converted ` +
-      `split differs with every deposit. Capital at work is the time-weighted capital ` +
-      `the APR is figured on: a deposit made later in the window counts for fewer days, ` +
-      `which is why it can read lower than total cost basis. (Converting the deposit ` +
+          <p class="fine" style="margin:10px 0 0">Cost Basis is the FIFO net capital ` +
+      `still in the pool at cost &mdash; deposits at cost minus withdrawals consuming ` +
+      `the oldest lots. Total Deposits is the actual amount that went in, before the ` +
+      `protocol converted it into the pool position &mdash; the purest comparable ` +
+      `figure, since Ryze pools aren't 50/50 and the converted split differs with ` +
+      `every deposit. Total Withdrawals values each genuine withdrawal at its own ` +
+      `day's market price (pool migrations that re-deposit are excluded &mdash; that ` +
+      `capital never left). Because withdrawals are shown at market while Cost Basis ` +
+      `is at cost, the two can differ by market moves on withdrawn tokens. ` +
+      `Capital at work is the time-weighted capital the APR is figured on: a deposit ` +
+      `made later in the window counts for fewer days, which is why it can read lower ` +
+      `than Total Deposits. (Converting the deposit ` +
       `into the pool position also costs a small amount in swap fees &mdash; typically ` +
       `a few dollars per deposit.) Market moves never change either number, so the APR ` +
       `is pure yield, not price appreciation. Current value is read live from each ` +
@@ -263,7 +270,10 @@
         <table>
           <tr><td>APY (weekly-comp)</td><td>${p.principalKnown ? pct(p.apy) : '<span class="na">n/a</span>'}</td></tr>
           <tr><td>Total rewards</td><td>${money(p.rewards)}</td></tr>
-          <tr><td>Total cost basis</td><td>${money(p.gross)}</td></tr>
+          <tr><td colspan="2" style="padding-top:6px;font-size:0.72rem;font-weight:700;letter-spacing:0.04em;color:var(--muted)">CAPITAL</td></tr>
+          <tr><td style="padding-left:10px">Cost Basis</td><td>${money(p.fifoPrincipal)}</td></tr>
+          <tr><td style="padding-left:10px">Total Deposits</td><td>${money(p.gross)}</td></tr>
+          <tr><td style="padding-left:10px">Total Withdrawals</td><td>${money(p.totalWithdrawn)}</td></tr>
           <tr><td>Current value${p.liveValue ? '' : ' (est.)'}</td><td>${money(p.curVal)}</td></tr>
           <tr><td>Claimed (${p.nClaims})</td><td>${money(p.claimed)}</td></tr>
           <tr><td>Unclaimed</td><td>${money(p.unclaimed)}</td></tr>
@@ -313,7 +323,9 @@
         <div class="row2">
           <div class="stat"><div class="k">APY</div><div class="v">${b.principalKnown ? pct(b.apy) : 'n/a'}</div></div>
           <div class="stat"><div class="k">Rewards</div><div class="v">${money(b.rewards)}</div></div>
-          <div class="stat"><div class="k">Total cost basis</div><div class="v">${money(b.gross)}</div></div>
+          <div class="stat"><div class="k">Cost Basis</div><div class="v">${money(b.fifoPrincipal)}</div></div>
+          <div class="stat"><div class="k">Total Deposits</div><div class="v">${money(b.gross)}</div></div>
+          <div class="stat"><div class="k">Total Withdrawals</div><div class="v">${money(b.totalWithdrawn)}</div></div>
           <div class="stat"><div class="k">Current value${b.liveValue ? '' : ' (est.)'}</div><div class="v">${money(b.curVal)}</div></div>
         </div>
       </div>
