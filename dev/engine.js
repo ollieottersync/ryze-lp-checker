@@ -1415,6 +1415,17 @@ const RyzeEngine = (() => {
         poolDays: pd,
         poolStart: poolStart[q],
         gross: gross[q],
+        // Cost Basis (FIFO net): deposits at cost minus withdrawals consuming
+        // the oldest lots at cost — the capital still in the pool right now.
+        fifoPrincipal: endBal[q],
+        // Total Withdrawals: genuine outflows only (pool-migration absorbed
+        // withdrawals are excluded — that capital never left the protocol),
+        // valued at each withdrawal's own day close, matching the breakdown.
+        totalWithdrawn: r4(
+          withdrawalDetail
+            .filter((w) => w.pool === q && !w.absorbed)
+            .reduce((s, w) => s + w.total, 0)
+        ),
         calc: depositDetail.filter((d) => d.pool === q),
         wdCalc: withdrawalDetail.filter((w) => w.pool === q),
         calcExact: wdByPool[q] === 0,
@@ -1437,6 +1448,8 @@ const RyzeEngine = (() => {
       rewards: bRew,
       twap: bTwap,
       gross: gross.W + gross.B,
+      fifoPrincipal: r4(endBal.W + endBal.B),
+      totalWithdrawn: r4(pools.W.totalWithdrawn + pools.B.totalWithdrawn),
       curVal: pools.W.curVal + pools.B.curVal,
       liveValue: pools.W.liveValue && pools.B.liveValue,
       apr: bApr,
