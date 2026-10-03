@@ -270,8 +270,8 @@
         <table>
           <tr><td>APY (weekly-comp)</td><td>${p.principalKnown ? pct(p.apy) : '<span class="na">n/a</span>'}</td></tr>
           <tr><td>Total rewards</td><td>${money(p.rewards)}</td></tr>
-          <tr><td colspan="2" style="padding-top:6px;font-size:0.72rem;font-weight:700;letter-spacing:0.04em;color:var(--muted)">CAPITAL</td></tr>
-          <tr><td style="padding-left:10px">Cost Basis</td><td>${money(p.fifoPrincipal)}</td></tr>
+          <tr><td colspan="2" style="padding-top:6px;font-size:0.72rem;font-weight:700;letter-spacing:0.04em;color:var(--muted);text-align:left">CAPITAL</td></tr>
+          <tr><td>Cost Basis</td><td>${money(p.fifoPrincipal)}</td></tr>
           <tr><td style="padding-left:10px">Total Deposits</td><td>${money(p.gross)}</td></tr>
           <tr><td style="padding-left:10px">Total Withdrawals</td><td>${money(p.totalWithdrawn)}</td></tr>
           <tr><td>Current value${p.liveValue ? '' : ' (est.)'}</td><td>${money(p.curVal)}</td></tr>
