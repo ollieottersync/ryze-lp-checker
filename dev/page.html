@@ -125,7 +125,7 @@
 
   <div class="card" id="subcard">
     <h2 style="margin:0 0 6px;font-size:1.15rem">Get the weekly digest</h2>
-    <p class="sub" style="margin-bottom:14px">One email every Monday with this wallet's realized APR, total cost basis, current value, and rewards. Double opt-in &mdash; confirm via the email we send you. Unsubscribe anytime.</p>
+    <p class="sub" style="margin-bottom:14px">One email every Monday with this wallet's realized APR, Cost Basis, Total Deposits, current value, and rewards. Double opt-in &mdash; confirm via the email we send you. Unsubscribe anytime.</p>
     <form id="subform" autocomplete="off">
       <label for="subemail">Email</label>
       <input type="text" id="subemail" name="subemail" spellcheck="false" placeholder="you@example.com" style="margin-bottom:12px">
@@ -144,13 +144,13 @@
       <div>
         <h4>Methodology</h4>
         <ul>
-          <li>Total cost basis = the actual amount the wallet committed, valued on deposit day &mdash; what went in <i>before</i> the protocol converted it into the pool position. The purest comparable figure: Ryze pools aren't 50/50, so the converted split differs with every deposit. Capital at work time-weights that over the window (a deposit made later counts for fewer days), which is why it can read lower than total cost basis. The APR is always figured on capital at work.</li>
-          <li>Capital at work = FIFO cost basis of what's in the pool, averaged over the window: each deposit is valued at that day's close (Kraken daily closes, USDC = $1); withdrawals consume the oldest lots first at their original cost. Market moves after a deposit never change it.</li>
+          <li>Cost Basis = the FIFO net capital still in the pool, at cost &mdash; deposits at cost minus withdrawals consuming the oldest lots. Total Deposits = the actual amount the wallet committed, valued on deposit day &mdash; what went in <i>before</i> the protocol converted it into the pool position. The purest comparable figure: Ryze pools aren't 50/50, so the converted split differs with every deposit. Total Withdrawals = genuine outflows, each valued at its own day's market price (pool migrations that re-deposit are excluded). Capital at work time-weights the Cost Basis over the window (a deposit made later counts for fewer days), which is why it can read lower than Total Deposits. The APR is always figured on capital at work.</li>
+          <li>Capital at work = FIFO Cost Basis of what's in the pool, averaged over the window: each deposit is valued at that day's close (Kraken daily closes, USDC = $1); withdrawals consume the oldest lots first at their original cost. Market moves after a deposit never change it.</li>
           <li>Current value = your live staked position, read on-chain from each pool's staking gauge via <code>getStake(address)</code> and priced as pool reserves &divide; LP supply &mdash; the exact position right now, not an estimate. If the on-chain read fails, it falls back to valuing your remaining deposit lots at today's closes, marked (est.). The gap between current value and capital at work is market gain or loss.</li>
           <li>Deposits: transactions where the wallet sends USDC/WETH/cbBTC and the same transaction deposits LP into a Ryze pool. Plain swaps excluded; dust returned to the wallet is netted off.</li>
           <li>Withdrawals: transactions that burn pool LP with underlying returned to the wallet.</li>
           <li>Rewards = claimed (pool &rarr; wallet USDC transfers) + unclaimed (read live from each pool's claimable-rewards view).</li>
-          <li>Realized APR = rewards &divide; capital at work &times; 365/days (capital at work is the time-weighted average over the window; total cost basis is shown alongside so you can see what actually went in). APY = (1+APR/52)<sup>52</sup>&minus;1 (weekly compounding).</li>
+          <li>Realized APR = rewards &divide; capital at work &times; 365/days (capital at work is the time-weighted average over the window; Cost Basis and Total Deposits are shown alongside so you can see what's still in and what actually went in). APY = (1+APR/52)<sup>52</sup>&minus;1 (weekly compounding).</li>
         </ul>
         <details class="deet">
           <summary>How capital at work is computed, step by step</summary>
