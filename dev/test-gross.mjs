@@ -192,8 +192,8 @@ check('fallback: rewards still read', r2.pools.W.rewards, 9.04, 1e-9);
 
 // Digest email renders the new fields.
 const { subject, text, html } = buildDigestEmail(r, { email: 't@t.co', unsubUrl: 'https://x/unsub' });
-const htmlOk = html.includes('Total cost basis') && html.includes('$10,128.70') && html.includes('How this is calculated');
-const textOk = text.includes('Total cost basis: $10,128.70') && text.includes('How calculated');
+const htmlOk = html.includes('Cost Basis') && html.includes('Total Deposits') && html.includes('Total Withdrawals') && html.includes('$10,128.70') && html.includes('How this is calculated');
+const textOk = text.includes('Cost Basis: $10,128.70') && text.includes('Total Deposits: $10,128.70') && text.includes('Total Withdrawals: $0.00') && text.includes('How calculated');
 if (!htmlOk) failures++;
 if (!textOk) failures++;
 console.log(`${htmlOk ? 'PASS' : 'FAIL'}  digest html has deposited + calc block`);
