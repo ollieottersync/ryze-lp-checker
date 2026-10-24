@@ -73,6 +73,9 @@ const RyzeEngine = (() => {
   const UNDERLYING_DECIMALS = { USDC: 6, WETH: 18, CBBTC: 8 };
 
   const BLOCKSCOUT = 'https://base.blockscout.com/api/v2';
+  // Sentinel thrown when Blockscout answers 403 from this network (Cloudflare
+  // challenge page). Callers catch it and use the RPC fallback below.
+  const BLOCKSCOUT_BLOCKED = 'blockscout-cloudflare-403';
   const KRAKEN = 'https://api.kraken.com/0/public/OHLC';
   const RPCS = [
     'https://rpc-base.ottersync.io/', // team's own Ottersync node — first priority
@@ -156,8 +159,10 @@ const RyzeEngine = (() => {
   //   1. Per-tx token transfers are IMMUTABLE — cache them forever. A retry
   //      after a rate-limit resumes where the previous attempt died instead
   //      of re-fetching hundreds of transactions from scratch.
-  //   2. The wallet's transfer list changes with new activity — cache it for
-  //      10 minutes so an immediate retry skips Blockscout entirely.
+  //   2. The wallet's transfer list changes with new activity — serve it
+  //      from cache for 10 minutes, then refresh incrementally (page from
+  //      the newest end until a page is fully known) instead of re-paging
+  //      the whole history.
   // Caching is best-effort: private mode / quota errors just mean no cache.
   const _store = (() => {
     try {
@@ -247,6 +252,13 @@ const RyzeEngine = (() => {
           signal: ctrl.signal,
         });
         clearTimeout(t);
+        if (res.status === 403 && url.startsWith(BLOCKSCOUT)) {
+          // Cloudflare "Just a moment" challenge: this network is challenged
+          // on every Blockscout request (VM/server egress), so no retry will
+          // ever pass. Fail fast with the sentinel so callers switch to the
+          // public-RPC fallback instead of burning minutes retrying.
+          throw new Error(BLOCKSCOUT_BLOCKED);
+        }
         if (res.status === 429 || res.status === 503) {
           // Rate-limited (or temporarily unavailable): honor the server's
           // Retry-After when present, otherwise back off exponentially
@@ -266,6 +278,7 @@ const RyzeEngine = (() => {
         return await res.json();
       } catch (e) {
         clearTimeout(t);
+        if (e && e.message === BLOCKSCOUT_BLOCKED) throw e; // no point retrying
         lastErr = e;
         await sleep(800 * (i + 1));
       }
@@ -301,6 +314,46 @@ const RyzeEngine = (() => {
       await sleep(150);
     }
     return items;
+  }
+
+  // Incremental variant of getPaginated for refreshing a cached wallet
+  // transfer list. The list is newest-first and transfers are immutable, so
+  // page from the head only until a full page comes back with nothing new —
+  // everything deeper is already in the cache. Returns just the new items
+  // (newest-first). A quiet wallet costs one request; a busy one costs only
+  // the pages that actually changed, instead of a full re-paging of its
+  // entire history on every visit.
+  async function getPaginatedIncremental(url, knownKeys, baseCount, onProgress) {
+    const fresh = [];
+    const seen = new Set(knownKeys);
+    let pp = '';
+    let page = 0;
+    for (;;) {
+      const d = await fetchJSON(url + pp, { tries: 4 });
+      const batch = d.items || [];
+      if (!batch.length) break;
+      let newOnPage = 0;
+      for (const x of batch) {
+        const key = (x.transaction_hash || '').toLowerCase() + '|' + x.log_index;
+        if (!seen.has(key)) {
+          seen.add(key);
+          fresh.push(x);
+          newOnPage++;
+        }
+      }
+      page++;
+      if (onProgress) onProgress(page, baseCount + fresh.length);
+      if (newOnPage === 0) break;
+      const npp = d.next_page_params;
+      if (!npp) break;
+      pp =
+        '?' +
+        Object.entries(npp)
+          .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+          .join('&');
+      await sleep(150);
+    }
+    return fresh;
   }
 
   function amt(x) {
@@ -347,11 +400,21 @@ const RyzeEngine = (() => {
       if (hit && Array.isArray(hit)) {
         _txCache.set(h, hit.map(unpackTransfer));
       } else {
-        const d = await fetchJSON(
-          `${BLOCKSCOUT}/transactions/${txHash}/token-transfers`,
-          { tries: 4 }
-        );
-        const items = d.items || [];
+        let items;
+        try {
+          const d = await fetchJSON(
+            `${BLOCKSCOUT}/transactions/${txHash}/token-transfers`,
+            { tries: 4 }
+          );
+          items = d.items || [];
+        } catch (e) {
+          if (e && e.message === BLOCKSCOUT_BLOCKED) {
+            markRpcFallback();
+            items = await rpcTxTransfers(txHash);
+          } else {
+            throw e;
+          }
+        }
         _txCache.set(h, items);
         cacheSet(TX_CACHE_PREFIX + h, items.map(packTransfer));
         await sleep(120);
@@ -377,9 +440,13 @@ const RyzeEngine = (() => {
   }
 
   // ------------------------------------------------------------- fetch ----
-  // Returns { items, cached }. The wallet transfer list is cached for 10
-  // minutes so a retry right after a rate-limit makes zero Blockscout calls
-  // for this step.
+  // Returns { items, cached }. The wallet transfer list is cached so repeat
+  // visits don't re-page the wallet's whole history from Blockscout:
+  // within 10 minutes the cached list is served as-is (zero requests);
+  // after that, a stale snapshot is refreshed incrementally — page from the
+  // newest end only until a full page is already known, then merge — so a
+  // typical revisit costs one or two requests. Only a first-ever visit (or
+  // an evicted cache) pays for the full pagination.
   function fetchWalletTransfers(wallet, onProgress) {
     const ck = ADDR_CACHE_PREFIX + wallet.toLowerCase();
     const hit = cacheGet(ck);
@@ -389,13 +456,471 @@ const RyzeEngine = (() => {
     ) {
       return Promise.resolve({ items: hit.items.map(unpackTransfer), cached: true });
     }
-    return getPaginated(
-      `${BLOCKSCOUT}/addresses/${wallet}/token-transfers`,
-      onProgress
-    ).then((items) => {
+    const url = `${BLOCKSCOUT}/addresses/${wallet}/token-transfers`;
+    const onBlocked = async () => {
+      markRpcFallback();
+      const items = await rpcWalletTransfersFallback(wallet, ck, onProgress);
       cacheSet(ck, { ts: Date.now(), items: items.map(packTransfer) });
       return { items, cached: false };
+    };
+    if (hit && Array.isArray(hit.items) && hit.items.length) {
+      const cachedItems = hit.items.map(unpackTransfer);
+      const knownKeys = new Set(
+        hit.items.map((t) => (t[0] || '').toLowerCase() + '|' + t[1])
+      );
+      return getPaginatedIncremental(url, knownKeys, cachedItems.length, onProgress)
+        .then((fresh) => {
+          const items = [...fresh, ...cachedItems];
+          cacheSet(ck, { ts: Date.now(), items: items.map(packTransfer) });
+          return { items, cached: fresh.length === 0 };
+        })
+        .catch(async (e) => {
+          if (e && e.message === BLOCKSCOUT_BLOCKED) return onBlocked();
+          throw e;
+        });
+    }
+    return getPaginated(url, onProgress)
+      .then((items) => {
+        cacheSet(ck, { ts: Date.now(), items: items.map(packTransfer) });
+        return { items, cached: false };
+      })
+      .catch(async (e) => {
+        if (e && e.message === BLOCKSCOUT_BLOCKED) return onBlocked();
+        throw e;
+      });
+  }
+
+  // --------------------------------------- public-RPC fallback (no Blockscout)
+  // When Blockscout serves a Cloudflare challenge to this network (server/VM
+  // egress — BLOCKSCOUT_BLOCKED sentinel), rebuild the same transfer shapes
+  // straight from a public Base RPC via eth_getLogs. Same packed format, same
+  // downstream math; only the source changes. Browsers keep using Blockscout
+  // (it works there); this path only fires where Blockscout is challenged.
+  // Several public Base RPCs. eth_getLogs is heavily range-capped on free
+  // tiers (drpc ~100 blocks, blastapi 10, 1rpc 50), so scanning uses a
+  // dedicated pool and adapts its window down on range errors. Light calls
+  // (receipts, eth_call, block headers) can use any endpoint.
+  function makePool(urls) {
+    return { urls, idx: 0 };
+  }
+  const RPC_SCAN = makePool([
+    'https://mainnet.base.org', // big getLogs ranges when not throttled
+    'https://base.drpc.org',
+  ]);
+  const RPC_LIGHT = makePool([
+    'https://base.drpc.org',
+    'https://base-mainnet.public.blastapi.io',
+    'https://1rpc.io/base',
+    'https://base.meowrpc.com',
+    'https://mainnet.base.org',
+  ]);
+
+  function rpcRateLimited(e) {
+    const m = String((e && e.message) || '').toLowerCase();
+    return (
+      e && (e.rpcHttp === 429 || /rate.?limit|request limit|too many requests/.test(m))
+    );
+  }
+
+  function rpcRangeLimited(e) {
+    return /block range|ranges over \d+ blocks/i.test(String((e && e.message) || ''));
+  }
+
+  // POST a JSON-RPC payload (single or batch), rotating endpoints within the
+  // pool on rate-limit errors. Throws on other failures.
+  async function rpcPost(payload, tries = 5, pool = RPC_LIGHT) {
+    let lastErr = null;
+    for (let i = 0; i < tries; i++) {
+      const url = pool.urls[pool.idx];
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (res.status === 429) {
+          const e = new Error('rpc: rate limited (HTTP 429)');
+          e.rpcHttp = 429;
+          throw e;
+        }
+        if (!res.ok) {
+          // Include the body: some providers (drpc) signal range caps as
+          // HTTP 400 with the reason in the body, and the scan adapts on it.
+          let detail = '';
+          try {
+            detail = (await res.text()).slice(0, 200);
+          } catch {
+            /* ignore */
+          }
+          const e = new Error('rpc HTTP ' + res.status + (detail ? ': ' + detail : ''));
+          e.rpcHttp = res.status;
+          throw e;
+        }
+        const d = await res.json();
+        const one = (x) => {
+          if (x && x.error)
+            throw new Error('rpc: ' + (x.error.message || 'unknown'));
+          return x ? x.result : null;
+        };
+        return Array.isArray(payload) ? d.map(one) : one(d);
+      } catch (e) {
+        lastErr = e;
+        if (rpcRateLimited(e)) {
+          pool.idx = (pool.idx + 1) % pool.urls.length;
+          noteRetry(`RPC endpoint throttled — switching to ${pool.urls[pool.idx]}…`);
+          await sleep(1500 * (i + 1));
+        } else {
+          await sleep(700 * (i + 1));
+        }
+      }
+    }
+    throw lastErr;
+  }
+    '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+  const TRANSFER_SIG =
+    '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+  const CURSOR_PREFIX = 'ryze.v1.rpccursor.';
+  const TOK_META_PREFIX = 'ryze.v1.tokm.';
+  const BLK_TS_PREFIX = 'ryze.v1.blkts.';
+  const RPC_EMPTY_STOP = 8; // stop a cold back-scan after 8 empty chunks
+  const RPC_MAX_COLD = 60; // cap a cold scan at ~15 days with no activity seen
+
+  let _rpcFallbackNoted = false;
+  function markRpcFallback() {
+    if (_rpcFallbackNoted) return;
+    _rpcFallbackNoted = true;
+    noteRetry(
+      'Blockscout is behind a Cloudflare challenge on this network — ' +
+        'rebuilding transfer history from the public Base RPC instead…'
+    );
+  }
+
+  async function rpcJson(method, params, tries = 5, pool = RPC_LIGHT) {
+    return rpcPost({ jsonrpc: '2.0', id: 1, method, params }, tries, pool);
+  }
+
+  // One HTTP round-trip for many calls. Individual failures throw.
+  async function rpcBatch(calls, tries = 5, pool = RPC_LIGHT) {
+    const payload = calls.map((c, i) => ({
+      jsonrpc: '2.0',
+      id: i + 1,
+      method: c.method,
+      params: c.params,
+    }));
+    return rpcPost(payload, tries, pool);
+  }
+
+  const unpadAddr = (t) => '0x' + String(t).slice(-40).toLowerCase();
+
+  // Decode an ABI string or bytes32 without Buffer (browser-safe).
+  function hexAscii(body) {
+    let s = '';
+    for (let i = 0; i + 2 <= body.length; i += 2) {
+      const c = parseInt(body.slice(i, i + 2), 16);
+      if (Number.isNaN(c) || c === 0) break;
+      if (c < 32 || c > 126) return '';
+      s += String.fromCharCode(c);
+    }
+    return s;
+  }
+  function decodeAbiStringish(hex) {
+    if (typeof hex !== 'string' || !hex.startsWith('0x')) return '';
+    const body = hex.slice(2);
+    if (body.length >= 128) {
+      // dynamic string: offset(32B) len(32B) data
+      const len = parseInt(body.slice(64, 128), 16);
+      if (Number.isFinite(len) && len > 0 && len <= 64 && body.length >= 128 + len * 2) {
+        const s = hexAscii(body.slice(128, 128 + len * 2));
+        if (s) return s;
+      }
+    }
+    return hexAscii(body.slice(0, 64)); // bytes32 fallback
+  }
+
+  const DECIMALS_SEL = '0x313ce567';
+  const SYMBOL_SEL = '0x95d89b41';
+  async function tokenMeta(addr) {
+    const a = addr.toLowerCase();
+    const hit = cacheGet(TOK_META_PREFIX + a);
+    if (hit && hit.decimals != null && hit.symbol) return hit;
+    let decimals = 18;
+    let symbol = '?';
+    try {
+      const [dr, sr] = await rpcBatch([
+        { method: 'eth_call', params: [{ to: a, data: DECIMALS_SEL }, 'latest'] },
+        { method: 'eth_call', params: [{ to: a, data: SYMBOL_SEL }, 'latest'] },
+      ]);
+      if (typeof dr === 'string' && dr.length >= 66) {
+        const d = parseInt(dr.slice(-64), 16);
+        if (Number.isFinite(d) && d <= 36) decimals = d;
+      }
+      const s = decodeAbiStringish(sr);
+      if (s) symbol = s;
+    } catch {
+      /* keep defaults */
+    }
+    // Blockscout reports cbBTC as 'CBBTC'; the engine's TOKENS list matches
+    // that. Normalize here so RPC and Blockscout paths classify identically.
+    if (a === CBBTC.toLowerCase()) symbol = 'CBBTC';
+    const meta = { symbol, decimals };
+    cacheSet(TOK_META_PREFIX + a, meta);
+    return meta;
+  }
+
+  // Block number (int) -> ISO timestamp, persistently cached.
+  async function blockTimestamps(blockNums) {
+    const out = new Map();
+    const missing = [];
+    for (const n of blockNums) {
+      const hit = cacheGet(BLK_TS_PREFIX + n);
+      if (hit) out.set(n, hit);
+      else missing.push(n);
+    }
+    for (let i = 0; i < missing.length; i += 100) {
+      const grp = missing.slice(i, i + 100);
+      let res;
+      try {
+        res = await rpcBatch(
+          grp.map((n) => ({
+            method: 'eth_getBlockByNumber',
+            params: ['0x' + n.toString(16), false],
+          }))
+        );
+      } catch {
+        res = [];
+      }
+      res.forEach((b, j) => {
+        if (b && b.timestamp) {
+          const iso = new Date(parseInt(b.timestamp, 16) * 1000).toISOString();
+          out.set(grp[j], iso);
+          cacheSet(BLK_TS_PREFIX + grp[j], iso);
+        }
+      });
+      await sleep(150);
+    }
+    return out;
+  }
+
+  // Raw Blockscout-shaped transfer from an eth_getLogs Transfer log.
+  function logToTransfer(log, meta, tsIso) {
+    let value = '0';
+    try {
+      value =
+        log.data && log.data.length > 2 ? BigInt(log.data).toString() : '0';
+    } catch {
+      value = '0';
+    }
+    return {
+      transaction_hash: log.transactionHash,
+      log_index: String(parseInt(log.logIndex, 16)),
+      token: { symbol: meta.symbol, decimals: meta.decimals, address: log.address },
+      total: { value },
+      from: { hash: unpadAddr(log.topics[1]) },
+      to: { hash: unpadAddr(log.topics[2]) },
+      timestamp: tsIso || '',
+    };
+  }
+
+  // One chunk of wallet activity: Transfer logs where the wallet is sender
+  // OR receiver, deduped (self-transfers appear in both). Uses the scan pool.
+  async function rpcGetLogsChunk(wPad, lo, hi) {
+    const base = {
+      fromBlock: '0x' + lo.toString(16),
+      toBlock: '0x' + hi.toString(16),
+    };
+    const [asSender, asReceiver] = await rpcBatch(
+      [
+        {
+          method: 'eth_getLogs',
+          params: [{ ...base, topics: [TRANSFER_SIG, wPad] }],
+        },
+        {
+          method: 'eth_getLogs',
+          params: [{ ...base, topics: [TRANSFER_SIG, null, wPad] }],
+        },
+      ],
+      5,
+      RPC_SCAN
+    );
+    const seen = new Map();
+    for (const l of [...(asSender || []), ...(asReceiver || [])]) {
+      if (!l || !l.topics || l.topics.length < 3 || !l.transactionHash) continue;
+      seen.set(l.transactionHash + '|' + l.logIndex, l);
+    }
+    return [...seen.values()];
+  }
+
+  // Forward scan of [lo, hi] with a self-tuning window: start wide, shrink on
+  // range-limit errors (free RPCs cap getLogs windows anywhere from 10 to
+  // 10k blocks).
+  async function rpcScanRange(wPad, lo, hi, onProgress) {
+    const logs = [];
+    let chunk = 10000;
+    let n = 0;
+    let successes = 0;
+    let cur = lo;
+    while (cur <= hi) {
+      const end = Math.min(hi, cur + chunk - 1);
+      try {
+        const l = await rpcGetLogsChunk(wPad, cur, end);
+        logs.push(...l);
+        n++;
+        successes++;
+        // Probe back upward periodically: a transient rotation to a capped
+        // endpoint shouldn't pin the window small forever.
+        if (successes % 25 === 0 && chunk < 10000) {
+          chunk = Math.min(10000, chunk * 4);
+        }
+        if (onProgress) onProgress(n, logs.length);
+        cur = end + 1;
+        await sleep(150);
+      } catch (e) {
+        if (rpcRangeLimited(e) && chunk > 50) {
+          chunk = Math.max(50, Math.floor(chunk / 4));
+          noteRetry(`RPC getLogs window too wide — retrying with ${chunk}-block windows…`);
+          continue;
+        }
+        throw e;
+      }
+    }
+    return logs;
+  }
+
+  // Block number whose timestamp is >= tsMs (binary search; ~26 light calls).
+  async function blockNumberForTimestamp(tsMs) {
+    const head = parseInt(await rpcJson('eth_blockNumber', []), 16);
+    let lo = 0;
+    let hi = head;
+    while (lo < hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      const b = await rpcJson('eth_getBlockByNumber', ['0x' + mid.toString(16), false]);
+      const t = b && b.timestamp ? parseInt(b.timestamp, 16) * 1000 : 0;
+      if (t < tsMs) lo = mid + 1;
+      else hi = mid;
+      await sleep(60);
+    }
+    return lo;
+  }
+
+  async function hydrateLogs(logs) {
+    if (!logs.length) return [];
+    const blocks = [...new Set(logs.map((l) => parseInt(l.blockNumber, 16)))];
+    const tsMap = await blockTimestamps(blocks);
+    const metas = new Map();
+    for (const a of new Set(logs.map((l) => l.address.toLowerCase()))) {
+      metas.set(a, await tokenMeta(a));
+    }
+    return logs.map((l) => {
+      const bn = parseInt(l.blockNumber, 16);
+      return logToTransfer(l, metas.get(l.address.toLowerCase()), tsMap.get(bn));
     });
+  }
+
+  // Incremental catch-up: start from the last good snapshot (even if its
+  // 10-minute TTL expired — the data is still valid history) and scan only
+  // the blocks since. Merges with dedupe, then advances the RPC cursor so
+  // the next run is incremental too.
+  async function rpcIncrementalTransfers(wallet, stale, onProgress) {
+    const w = wallet.toLowerCase();
+    const wPad = '0x' + w.slice(2).padStart(64, '0');
+    const latest = parseInt(await rpcJson('eth_blockNumber', []), 16);
+    const fromBlock = Math.max(0, (await blockNumberForTimestamp(stale.ts)) - 500);
+    const logs = await rpcScanRange(wPad, fromBlock, latest, onProgress);
+    const base = stale.items.map(unpackTransfer);
+    const seen = new Set(
+      base.map((t) => t.transaction_hash + '|' + t.log_index)
+    );
+    for (const t of await hydrateLogs(logs)) {
+      const k = t.transaction_hash + '|' + t.log_index;
+      if (!seen.has(k)) {
+        seen.add(k);
+        base.push(t);
+      }
+    }
+    cacheSet(CURSOR_PREFIX + w, latest);
+    return base;
+  }
+
+  // Fallback entry point: prefer the incremental path from the last good
+  // snapshot; full cold back-scan only when there is no snapshot at all.
+  async function rpcWalletTransfersFallback(wallet, ck, onProgress) {
+    const stale = cacheGet(ck);
+    if (stale && stale.ts && Array.isArray(stale.items) && stale.items.length) {
+      noteRetry(
+        'Using the last good transfer snapshot plus a one-week RPC catch-up scan…'
+      );
+      return rpcIncrementalTransfers(wallet, stale, onProgress);
+    }
+    return (await rpcWalletTransfers(wallet, onProgress)).items;
+  }
+
+  async function rpcWalletTransfers(wallet, onProgress) {
+    const w = wallet.toLowerCase();
+    const wPad = '0x' + w.slice(2).padStart(64, '0');
+    const latest = parseInt(await rpcJson('eth_blockNumber', []), 16);
+    const all = [];
+    const cur = cacheGet(CURSOR_PREFIX + w);
+    if (typeof cur === 'number' && cur >= 0) {
+      // Incremental: only blocks after the last fully-scanned one.
+      const logs = await rpcScanRange(wPad, cur + 1, latest, onProgress);
+      all.push(...logs);
+      cacheSet(CURSOR_PREFIX + w, latest);
+    } else {
+      // Cold back-scan: fixed small windows (free-RPC safe), stop after 8
+      // consecutive empty chunks once activity has been seen (or cap at 60
+      // chunks with nothing seen). Only used when no snapshot exists at all.
+      const COLD_CHUNK = 100;
+      let hi = latest;
+      let empty = 0;
+      let seenAny = false;
+      let chunks = 0;
+      let scannedLo = 0;
+      for (;;) {
+        const lo = Math.max(0, hi - COLD_CHUNK + 1);
+        const logs = await rpcGetLogsChunk(wPad, lo, hi);
+        chunks++;
+        if (onProgress) onProgress(chunks, all.length);
+        if (logs.length === 0) {
+          empty++;
+          if ((seenAny && empty >= RPC_EMPTY_STOP) || (!seenAny && chunks >= RPC_MAX_COLD)) {
+            scannedLo = lo;
+            break;
+          }
+        } else {
+          empty = 0;
+          seenAny = true;
+          all.push(...logs);
+        }
+        await sleep(120);
+        if (lo === 0) {
+          scannedLo = 0;
+          break;
+        }
+        hi = lo - 1;
+      }
+      cacheSet(CURSOR_PREFIX + w, Math.max(0, scannedLo - 1));
+    }
+    return { items: await hydrateLogs(all), cached: false };
+  }
+
+  // Per-tx token transfers for txs not in the forever-cache, via receipt logs.
+  async function rpcTxTransfers(txHash) {
+    const receipt = await rpcJson('eth_getTransactionReceipt', [txHash]);
+    const logs = ((receipt && receipt.logs) || []).filter(
+      (l) => l.topics && l.topics[0] === TRANSFER_SIG && l.topics.length >= 3
+    );
+    let tsIso = '';
+    if (receipt && receipt.blockNumber) {
+      const m = await blockTimestamps([parseInt(receipt.blockNumber, 16)]);
+      tsIso = m.get(parseInt(receipt.blockNumber, 16)) || '';
+    }
+    const metas = new Map();
+    for (const a of new Set(logs.map((l) => l.address.toLowerCase()))) {
+      metas.set(a, await tokenMeta(a));
+    }
+    return logs.map((l) =>
+      logToTransfer(l, metas.get(l.address.toLowerCase()), tsIso)
+    );
   }
 
   // Kraken hourly closes for the live price tail. History comes from the
